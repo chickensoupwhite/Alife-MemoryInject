@@ -412,7 +412,7 @@ public class MemoryInjectModule(
             vectorsReady = false;
 
             DateTime cutoff = DateTime.Now.AddDays(-Math.Max(0, Configuration.SkipRecentDays));
-            foreach (string file in Directory.EnumerateFiles(memoryRoot, "*.md", SearchOption.AllDirectories))
+            foreach (string file in EnumerateMemoryFiles(memoryRoot))
             {
                 try
                 {
@@ -445,6 +445,14 @@ public class MemoryInjectModule(
 
     // ===== 向量 =====
 
+    /// <summary>枚举记忆目录下的记忆文件（兼容 .md 与 .txt 两种后缀）。</summary>
+    static IEnumerable<string> EnumerateMemoryFiles(string root)
+    {
+        foreach (string pat in new[] { "*.md", "*.txt" })
+            foreach (string f in Directory.EnumerateFiles(root, pat, SearchOption.AllDirectories))
+                yield return f;
+    }
+
     /// <summary>
     /// 确保索引可用：index.json 不存在、或比记忆目录最新文件还旧，就请侧车重建。
     /// 重建慢，一律后台；失败只记日志，绝不外抛。
@@ -466,7 +474,7 @@ public class MemoryInjectModule(
             {
                 DateTime idxTime = File.GetLastWriteTime(indexPath);
                 DateTime newest = idxTime;
-                foreach (string f in Directory.EnumerateFiles(memoryRoot, "*.md", SearchOption.AllDirectories))
+                foreach (string f in EnumerateMemoryFiles(memoryRoot))
                 {
                     try { DateTime t = File.GetLastWriteTime(f); if (t > newest) newest = t; } catch { }
                 }
