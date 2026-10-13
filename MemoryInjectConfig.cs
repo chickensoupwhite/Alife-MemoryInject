@@ -2,7 +2,7 @@
 using System.Collections.Generic;
 using System.ComponentModel;
 
-namespace Mao.MemoryInject;
+namespace Mao.MemoryRecall;
 
 /// <summary>
 /// Mao.MemoryInject —— 记忆回忆提示配置。
@@ -61,6 +61,34 @@ public class MemoryInjectConfig
     [DisplayName("冷静时长（秒）")]
     [Description("触发冷静后暂停语义检索的秒数。默认 60。")]
     public int CooldownSeconds { get; set; } = 60;
+
+    [DisplayName("触发高水位（字）")]
+    [Description("攒够这么多有效字数才做一次检索；不到就不查，避免每句都触发、时而有时而无。建议 60。")]
+    public int WaterHighChars { get; set; } = 60;
+
+    [DisplayName("回落低水位（字）")]
+    [Description("触发一次检索后，水位回落到这个值再重新攒。建议 0。")]
+    public int WaterLowChars { get; set; } = 0;
+
+    [DisplayName("两次触发最小间隔（秒）")]
+    [Description("两次检索提示之间至少隔这么多秒，防止连发。建议 20。")]
+    public int TriggerCooldownSeconds { get; set; } = 20;
+
+    [DisplayName("衰减半衰期（天）")]
+    [Description("记忆权重的半衰期：这么久没被命中过，它的排序权重就减半（命中会强化、把计时归零）。越大越念旧。建议 30。")]
+    public int HalfLifeDays { get; set; } = 30;
+
+    [DisplayName("每日维护间隔（小时）")]
+    [Description("后台每隔这么久自动整理一次索引（衰减/清理）。建议 20（约一天一次）。")]
+    public int MaintainIntervalHours { get; set; } = 20;
+
+    [DisplayName("启用图谱兜底")]
+    [Description("关键词、语义都没命中时，顺着人/事/物的关系链再扩一层找。关了更省、召回更保守。默认开。")]
+    public bool UseGraph { get; set; } = true;
+
+    [DisplayName("块粒度上限（字）")]
+    [Description("一条记忆切成多大块：切得细召回准、切得粗索引小。改动后需重建索引。建议 200。")]
+    public int BlockMaxChars { get; set; } = 200;
 
     [DisplayName("提示文本")]
     [Description("命中后追加到消息末尾的提示。{n} 替换成命中条数，{files} 替换成命中的文件，{path} 替换成记忆目录。")]
