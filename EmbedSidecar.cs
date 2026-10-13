@@ -9,7 +9,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace Mao.MemoryInject;
+namespace Mao.MemoryRecall;
 
 /// <summary>
 /// 嵌入计算子进程管理：拉起常驻 Python 服务，通过 stdin/stdout 交换 JSON。
@@ -214,6 +214,178 @@ public sealed class EmbedSidecar : IAsyncDisposable
         }
         catch
         {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 有上限的同步召回：最多阻塞 waitMs 毫秒拿书签文本。
+    /// 侧车常驻后单次约十几毫秒；超时或未就绪立刻返回 null，绝不死等、绝不外抛。
+    /// 走 Task.Run 隔离，不会把同步钩子所在的 UI 线程拖死。
+    /// </summary>
+    public string? RecallSync(string query, int waitMs, string? indexPath = null, double? halfLife = null, bool? useGraph = null)
+    {
+        if (IsReady == false || Busy || process == null || process.HasExited) return null;
+        int budget = Math.Max(waitMs, 20);
+        Task<string?> t = Task.Run(() => RecallAsync(query, budget * 4, indexPath, halfLife, useGraph));
+        try
+        {
+            if (t.Wait(budget) == false) return null;
+            return t.Result;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>异步召回：发 recall 请求给侧车、拿书签文本；失败返回 null。</summary>
+    public async Task<string?> RecallAsync(string query, int timeoutMs = 800, string? indexPath = null, double? halfLife = null, bool? useGraph = null)
+    {
+        if (IsReady == false || process == null || process.HasExited) return null;
+        int id = Interlocked.Increment(ref nextId);
+        TaskCompletionSource<JsonElement> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pending[id] = tcs;
+
+        try
+        {
+            string payload = JsonSerializer.Serialize(new { id, fn = "recall", query, top_k = 5, index = indexPath ?? "", half_life = halfLife, use_graph = useGraph });
+            await writeLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                await stdin!.WriteLineAsync(payload.AsMemory()).ConfigureAwait(false);
+                await stdin.FlushAsync().ConfigureAwait(false);
+            }
+            finally { writeLock.Release(); }
+
+            Task done = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs)).ConfigureAwait(false);
+            if (done != tcs.Task)
+            {
+                pending.TryRemove(id, out _);
+                return null;
+            }
+
+            JsonElement root = await tcs.Task.ConfigureAwait(false);
+            if (root.TryGetProperty("ok", out JsonElement okEl) == false || okEl.GetBoolean() == false)
+                return null;
+            if (root.TryGetProperty("bookmarks", out JsonElement bmEl) == false)
+                return null;
+            string? s = bmEl.GetString();
+            return string.IsNullOrWhiteSpace(s) ? null : s;
+        }
+        catch
+        {
+            pending.TryRemove(id, out _);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 后台重建索引：请侧车扫描记忆目录、重写 index.json，并清掉自己的索引缓存。
+    /// 重建慢，调用方一律放后台；超时/失败返回 null，绝不外抛。
+    /// </summary>
+    public async Task<(int count, string outPath)?> BuildAsync(string memdir, string? outPath = null, int timeoutMs = 60000, int? blockMax = null)
+    {
+        if (IsReady == false || process == null || process.HasExited) return null;
+        if (string.IsNullOrWhiteSpace(memdir)) return null;
+
+        int id = Interlocked.Increment(ref nextId);
+        TaskCompletionSource<JsonElement> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pending[id] = tcs;
+
+        try
+        {
+            string payload = JsonSerializer.Serialize(new { id, fn = "build", memdir, @out = outPath ?? "", block_max = blockMax });
+            await writeLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                await stdin!.WriteLineAsync(payload.AsMemory()).ConfigureAwait(false);
+                await stdin.FlushAsync().ConfigureAwait(false);
+            }
+            finally { writeLock.Release(); }
+
+            Task done = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs)).ConfigureAwait(false);
+            if (done != tcs.Task)
+            {
+                pending.TryRemove(id, out _);
+                Status = "建索引超时";
+                return null;
+            }
+
+            JsonElement root = await tcs.Task.ConfigureAwait(false);
+            if (root.TryGetProperty("ok", out JsonElement okEl) == false || okEl.GetBoolean() == false)
+                return null;
+            int c = root.TryGetProperty("count", out JsonElement cEl) ? cEl.GetInt32() : 0;
+            string o = root.TryGetProperty("out", out JsonElement oEl) ? oEl.GetString() ?? "" : "";
+            return (c, o);
+        }
+        catch
+        {
+            pending.TryRemove(id, out _);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 通用查询口：给 fetch / profile / loops 这类只读工具用。
+    /// 侧车返回的 text 字段原样带回；超时/失败返回 null，绝不死等、绝不外抛。
+    /// </summary>
+    public string? AskSync(string fn, Dictionary<string, object?> args, int waitMs, string? indexPath = null)
+    {
+        if (IsReady == false || process == null || process.HasExited) return null;
+        int budget = Math.Max(waitMs, 50);
+        Task<string?> t = Task.Run(() => AskAsync(fn, args, budget * 4, indexPath));
+        try
+        {
+            if (t.Wait(budget) == false) return null;
+            return t.Result;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>异步版通用查询：发 fn + args 给侧车，取回 text 字段。</summary>
+    public async Task<string?> AskAsync(string fn, Dictionary<string, object?> args, int timeoutMs = 3000, string? indexPath = null)
+    {
+        if (IsReady == false || process == null || process.HasExited) return null;
+
+        int id = Interlocked.Increment(ref nextId);
+        TaskCompletionSource<JsonElement> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pending[id] = tcs;
+
+        try
+        {
+            var payload = new Dictionary<string, object?>(args) { ["id"] = id, ["fn"] = fn, ["index"] = indexPath ?? "" };
+            string json = JsonSerializer.Serialize(payload);
+
+            await writeLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                await stdin!.WriteLineAsync(json.AsMemory()).ConfigureAwait(false);
+                await stdin.FlushAsync().ConfigureAwait(false);
+            }
+            finally { writeLock.Release(); }
+
+            Task done = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs)).ConfigureAwait(false);
+            if (done != tcs.Task)
+            {
+                pending.TryRemove(id, out _);
+                return null;
+            }
+
+            JsonElement root = await tcs.Task.ConfigureAwait(false);
+            if (root.TryGetProperty("ok", out JsonElement okEl) == false || okEl.GetBoolean() == false)
+                return null;
+            if (root.TryGetProperty("text", out JsonElement txEl) == false)
+                return null;
+            string? s = txEl.GetString();
+            return string.IsNullOrWhiteSpace(s) ? null : s;
+        }
+        catch
+        {
+            pending.TryRemove(id, out _);
             return null;
         }
     }
