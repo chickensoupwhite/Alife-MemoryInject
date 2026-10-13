@@ -1,0 +1,252 @@
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace Mao.MemoryInject;
+
+/// <summary>
+/// 嵌入计算子进程管理：拉起常驻 Python 服务，通过 stdin/stdout 交换 JSON。
+/// 所有 await 均 ConfigureAwait(false)。
+/// </summary>
+public sealed class EmbedSidecar : IAsyncDisposable
+{
+    Process? process;
+    StreamWriter? stdin;
+    StreamReader? stdout;
+    CancellationTokenSource? readCts;
+    Task? readTask;
+
+    readonly SemaphoreSlim writeLock = new(1, 1);
+    readonly ConcurrentDictionary<int, TaskCompletionSource<JsonElement>> pending = new();
+    int nextId;
+
+    public bool IsReady { get; private set; }
+    public string Status { get; private set; } = "未启动";
+    public string Device { get; private set; } = "";
+
+    /// <summary>侧车是否正在跑批量向量化。批量时同步路径直接放过，绝不抢。</summary>
+    public volatile bool Busy;
+
+    readonly TaskCompletionSource<bool> readyTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>启动子进程并等待 ready。返回是否成功。</summary>
+    public async Task<bool> StartAsync(string scriptPath, string? pythonExe, int waitMs = 120000)
+    {
+        try
+        {
+            if (File.Exists(scriptPath) == false)
+            {
+                Status = "找不到脚本：" + scriptPath;
+                return false;
+            }
+
+            ProcessStartInfo psi = new()
+            {
+                FileName = string.IsNullOrWhiteSpace(pythonExe) ? "python" : pythonExe,
+                Arguments = $"\"{scriptPath}\"",
+                UseShellExecute = false,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8,
+            };
+            psi.Environment["PYTHONIOENCODING"] = "utf-8";
+            psi.Environment["PYTHONUTF8"] = "1";
+
+            process = new Process { StartInfo = psi, EnableRaisingEvents = true };
+            process.Start();
+            stdin = process.StandardInput;
+            stdout = process.StandardOutput;
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var err = process.StandardError;
+                    while (await err.ReadLineAsync().ConfigureAwait(false) != null) { }
+                }
+                catch { }
+            });
+
+            readCts = new CancellationTokenSource();
+            readTask = Task.Run(() => ReadLoopAsync(readCts.Token));
+
+            Task done = await Task.WhenAny(readyTcs.Task, Task.Delay(waitMs)).ConfigureAwait(false);
+            if (done == readyTcs.Task && readyTcs.Task.Result)
+            {
+                IsReady = true;
+                return true;
+            }
+            Status = "等待就绪超时";
+            return false;
+        }
+        catch (Exception e)
+        {
+            Status = "启动失败：" + e.Message;
+            return false;
+        }
+    }
+
+    async Task ReadLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            var reader = stdout!;
+            while (ct.IsCancellationRequested == false)
+            {
+                string? line = await reader.ReadLineAsync().ConfigureAwait(false);
+                if (line == null) break;
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                if (line[0] != '{') continue;
+
+                JsonElement root;
+                try
+                {
+                    using JsonDocument doc = JsonDocument.Parse(line);
+                    root = doc.RootElement.Clone();
+                }
+                catch { continue; }
+
+                if (root.TryGetProperty("fn", out JsonElement fnEl) &&
+                    fnEl.GetString() == "ready")
+                {
+                    Device = root.TryGetProperty("device", out JsonElement dv) ? dv.GetString() ?? "" : "";
+                    Status = "就绪 (" + Device + ")";
+                    readyTcs.TrySetResult(true);
+                    continue;
+                }
+
+                if (root.TryGetProperty("id", out JsonElement idEl) && idEl.TryGetInt32(out int id))
+                {
+                    if (pending.TryRemove(id, out TaskCompletionSource<JsonElement>? tcs))
+                        tcs.TrySetResult(root);
+                }
+            }
+        }
+        catch { }
+        finally
+        {
+            Status = "已退出";
+            foreach (KeyValuePair<int, TaskCompletionSource<JsonElement>> kv in pending)
+                kv.Value.TrySetException(new Exception("sidecar 已退出"));
+            pending.Clear();
+            readyTcs.TrySetResult(false);
+        }
+    }
+
+    /// <summary>批量向量化。失败或超时返回 null。</summary>
+    public async Task<float[][]?> EmbedAsync(string[] texts, int timeoutMs = 20000)
+    {
+        if (IsReady == false || process == null || process.HasExited) return null;
+        if (texts.Length == 0) return [];
+
+        int id = Interlocked.Increment(ref nextId);
+        TaskCompletionSource<JsonElement> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pending[id] = tcs;
+
+        try
+        {
+            string payload = JsonSerializer.Serialize(new { id, fn = "embed", texts });
+            await writeLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                await stdin!.WriteLineAsync(payload.AsMemory()).ConfigureAwait(false);
+                await stdin.FlushAsync().ConfigureAwait(false);
+            }
+            finally { writeLock.Release(); }
+
+            Task done = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs)).ConfigureAwait(false);
+            if (done != tcs.Task)
+            {
+                pending.TryRemove(id, out _);
+                Status = "请求超时";
+                return null;
+            }
+
+            JsonElement root = await tcs.Task.ConfigureAwait(false);
+            if (root.TryGetProperty("ok", out JsonElement okEl) == false || okEl.GetBoolean() == false)
+                return null;
+            if (root.TryGetProperty("vectors", out JsonElement vecEl) == false)
+                return null;
+
+            List<float[]> list = [];
+            foreach (JsonElement v in vecEl.EnumerateArray())
+            {
+                float[] arr = new float[v.GetArrayLength()];
+                int i = 0;
+                foreach (JsonElement f in v.EnumerateArray())
+                    arr[i++] = f.GetSingle();
+                list.Add(arr);
+            }
+            return [.. list];
+        }
+        catch
+        {
+            pending.TryRemove(id, out _);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 有上限的同步等待：最多阻塞 waitMs 毫秒拿一个查询向量。
+    /// 侧车常驻后单次约 10ms，正常无感；超时立刻返回 null，绝不死等。
+    /// 内部走 Task.Run 隔离，不会把调用方（同步钩子）拖死在 UI 线程上。
+    /// </summary>
+    public float[]? EmbedSync(string text, int waitMs)
+    {
+        if (IsReady == false || Busy || process == null || process.HasExited) return null;
+        int budget = Math.Max(waitMs, 20);
+        Task<float[][]?> t = Task.Run(() => EmbedAsync([text], budget * 4));
+        try
+        {
+            if (t.Wait(budget) == false) return null;
+            float[][]? v = t.Result;
+            return (v != null && v.Length > 0) ? v[0] : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        try
+        {
+            readCts?.Cancel();
+            if (stdin != null)
+            {
+                try
+                {
+                    await stdin.WriteLineAsync("{\"fn\":\"__shutdown__\"}").ConfigureAwait(false);
+                    await stdin.FlushAsync().ConfigureAwait(false);
+                }
+                catch { }
+            }
+            if (process != null && process.HasExited == false)
+            {
+                if (process.WaitForExit(3000) == false)
+                {
+                    try { process.Kill(); } catch { }
+                }
+            }
+            stdin?.Dispose();
+            stdout?.Dispose();
+            process?.Dispose();
+        }
+        catch { }
+        finally
+        {
+            IsReady = false;
+        }
+    }
+}
