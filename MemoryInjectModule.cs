@@ -42,6 +42,7 @@ public class MemoryInjectModule(
     string scriptPath = "";
     string indexPath = "";
     DateTime lastBuildCheck = DateTime.MinValue;
+    volatile bool warmDone = false;   // 索引/模型预热是否完成（未完成时首次查询给长窗口）
     DateTime lastScanStamp = DateTime.MinValue;
 
     readonly List<Chunk> chunks = [];
@@ -174,6 +175,14 @@ public class MemoryInjectModule(
                     {
                         // 先确保索引在：缺了或旧了，就地重建（后台，不占前台）
                         await EnsureIndexAsync(force: false).ConfigureAwait(false);
+                        // 预热：把索引读进内存、建好词表/DF，并吃掉模型首次编码开销。
+                        // 大库首次冷读要 2s+，会超出同步等待窗口；预热放到启动后台，不占真查询。
+                        try
+                        {
+                            await sidecar.AskAsync("warm", new Dictionary<string, object?>(), 120000, indexPath).ConfigureAwait(false);
+                            warmDone = true;
+                        }
+                        catch { }
                         await ComputeVectorsAsync().ConfigureAwait(false);
                     }
                 }
@@ -308,7 +317,9 @@ public class MemoryInjectModule(
 
             // 第一优先：按 人/事/物 查 index.json，拿到可读书签就直接用
             // （有上限等待，超时/异常一律放过，退回下面的原提示）
-            string? bookmarks = sidecar.RecallSync(stripped, Math.Max(Configuration.SyncWaitMs, 200), indexPath, Configuration.HalfLifeDays, Configuration.UseGraph);
+            int waitMs = Math.Max(Configuration.SyncWaitMs, 200);
+            if (warmDone == false) waitMs = Math.Max(waitMs, 5000);   // 预热未完成：给大库冷读留出时间，别当没命中
+            string? bookmarks = sidecar.RecallSync(stripped, waitMs, indexPath, Configuration.HalfLifeDays, Configuration.UseGraph);
             if (string.IsNullOrWhiteSpace(bookmarks) == false)
             {
                 // ★add-only 原则：只在本条消息末尾"追加"临时书签，绝不改写原 message、
