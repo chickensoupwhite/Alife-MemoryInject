@@ -809,7 +809,7 @@ def build_index(memdir, outpath=None):
         outpath = os.path.join(_HERE, "index.json")
     entries = []
     for fname in sorted(os.listdir(memdir)):
-        if not fname.endswith(".md"):
+        if not fname.lower().endswith((".md", ".txt")):
             continue
         fpath = os.path.join(memdir, fname)
         text = io.open(fpath, encoding="utf-8", errors="ignore").read()
