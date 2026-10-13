@@ -448,9 +448,17 @@ public class MemoryInjectModule(
     /// <summary>枚举记忆目录下的记忆文件（兼容 .md 与 .txt 两种后缀）。</summary>
     static IEnumerable<string> EnumerateMemoryFiles(string root)
     {
+        string[] skip = { "settled", "backup" };
         foreach (string pat in new[] { "*.md", "*.txt" })
             foreach (string f in Directory.EnumerateFiles(root, pat, SearchOption.AllDirectories))
-                yield return f;
+            {
+                string rel = f.Substring(root.Length).Replace('\\', '/');
+                if (rel.Contains(".bak", StringComparison.OrdinalIgnoreCase)) continue;
+                bool skipIt = false;
+                foreach (string d in skip)
+                    if (rel.Contains("/" + d + "/")) { skipIt = true; break; }
+                if (!skipIt) yield return f;
+            }
     }
 
     /// <summary>
