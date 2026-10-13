@@ -57,6 +57,22 @@ CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
 WORD_RE = re.compile(r"[A-Za-z0-9]+")
 
 _IDX = {"path": None, "data": None, "vocab": None, "df": None}
+# 多角色共用同一个侧车进程：按"索引路径"分桶缓存，切角色时不必反复冷读。
+_CACHE = {}         # path -> {"data":..., "vocab":..., "df":...}
+_CACHE_ORDER = []   # LRU 顺序（最近用的排后）
+_CACHE_MAX = 3      # 最多缓存几份完整索引（三四个角色够用，不无限吃内存）
+
+
+def _cache_put(path, key, val):
+    if not path:
+        return
+    c = _CACHE.setdefault(path, {"data": None, "vocab": None, "df": None})
+    c[key] = val
+    if path in _CACHE_ORDER:
+        _CACHE_ORDER.remove(path)
+    _CACHE_ORDER.append(path)
+    while len(_CACHE_ORDER) > _CACHE_MAX:
+        _CACHE.pop(_CACHE_ORDER.pop(0), None)
 
 
 def _find_index():
@@ -69,12 +85,22 @@ def _find_index():
 
 
 def _set_index(path):
-    """切换当前使用的索引文件（多角色各自一份，不打架）。"""
+    """切换当前使用的索引文件（多角色各自一份，不打架）。
+    命中分桶缓存就直接用热的，避免多角色来回切时反复冷读。"""
     if path and os.path.isfile(path) and _IDX.get("path") != path:
         _IDX["path"] = path
-        _IDX["data"] = None
-        _IDX["vocab"] = None
-        _IDX["df"] = None
+        c = _CACHE.get(path)
+        if c is not None:
+            _IDX["data"] = c.get("data")
+            _IDX["vocab"] = c.get("vocab")
+            _IDX["df"] = c.get("df")
+            if path in _CACHE_ORDER:
+                _CACHE_ORDER.remove(path)
+            _CACHE_ORDER.append(path)
+        else:
+            _IDX["data"] = None
+            _IDX["vocab"] = None
+            _IDX["df"] = None
 
 
 def _load_index():
@@ -87,6 +113,7 @@ def _load_index():
                 _IDX["data"] = json.load(f)
         else:
             _IDX["data"] = []
+        _cache_put(_IDX["path"], "data", _IDX["data"])
     return _IDX["data"]
 
 
@@ -101,6 +128,7 @@ def _vocab():
                         words.add(w)
         # 长的排前面：保证"血压计"不会被切成"血压"
         _IDX["vocab"] = sorted(words, key=lambda w: -len(w))
+        _cache_put(_IDX["path"], "vocab", _IDX["vocab"])
     return _IDX["vocab"]
 
 
@@ -204,6 +232,7 @@ def _df():
         for t in set(tokenize(tags)):
             df[t] = df.get(t, 0) + 1
     _IDX["df"] = df
+    _cache_put(_IDX["path"], "df", df)
     return df
 
 
@@ -365,11 +394,31 @@ def recall(query, top_k=5, min_ratio=0.45, date_from=None, date_to=None, period=
     qv = _embed([query]) if _MODEL["ready"] else None
     fused = None
     if qv:
+        # ★大库保护：关键词路已按分数降序，只对前 N 条做语义精排。
+        #   之前对全部命中逐条 embed，大库(3万条)会拖到 1s+，超出同步等待窗口。
+        SEM_TOP = 80
+        cand = scored[:SEM_TOP]
+        vecs = [None] * len(cand)
+        to_embed, to_idx = [], []
+        for i, (_, _, _, e) in enumerate(cand):
+            key = e.get("id") or e.get("anchor") or ""
+            v = _VEC_CACHE.get(key)
+            if v is not None:
+                vecs[i] = v
+            else:
+                to_embed.append(_field_text(e, "summary") + " " + _field_text(e, "text")[:300])
+                to_idx.append(i)
+        if to_embed:
+            vs = _embed(to_embed) or []
+            for j, i in enumerate(to_idx):
+                if j < len(vs):
+                    vecs[i] = vs[j]
+                    e = cand[i][3]
+                    _VEC_CACHE[e.get("id") or e.get("anchor") or ""] = vs[j]
         sims = []
-        for _, _, _, e in scored:
-            ev = _entry_vector(e)
-            if ev:
-                sims.append((_cos(qv[0], ev), e))
+        for i, (_, _, _, e) in enumerate(cand):
+            if vecs[i]:
+                sims.append((_cos(qv[0], vecs[i]), e))
         if sims:
             sims.sort(key=lambda x: x[0], reverse=True)
             sem_rank = {id(e): i + 1 for i, (_, e) in enumerate(sims)}
@@ -1041,6 +1090,19 @@ def main():
         try:
             if fn == "ping":
                 reply({"id": rid, "ok": True, "device": _MODEL["device"], "dim": 512})
+            elif fn == "warm":
+                # 预热：后台把索引读进来并建好词表/DF，真查询时就是热的（大库首次冷读会超 200ms 窗口）
+                _set_index(req.get("index"))
+                _load_index()
+                _vocab()
+                _df()
+                # 再吃掉模型/CUDA 的"首次编码"开销：空转一次 embed，真查询就不带这笔了
+                if _MODEL.get("ready"):
+                    try:
+                        _embed(["预热"])
+                    except Exception:
+                        pass
+                reply({"id": rid, "ok": True, "count": len(_IDX["data"] or [])})
             elif fn == "embed":
                 texts = req.get("texts") or []
                 vecs = _embed(texts) or []
