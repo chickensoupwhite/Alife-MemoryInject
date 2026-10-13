@@ -808,10 +808,16 @@ def build_index(memdir, outpath=None):
     if not outpath:
         outpath = os.path.join(_HERE, "index.json")
     entries = []
-    for fname in sorted(os.listdir(memdir)):
-        if not fname.lower().endswith((".md", ".txt")):
-            continue
-        fpath = os.path.join(memdir, fname)
+    allfiles = []
+    skip_dirs = {"settled", "backup", "备份"}
+    for root, dirs, _files in os.walk(memdir):
+        dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith(".")]
+        for fn in _files:
+            if fn.lower().endswith((".md", ".txt")) and ".bak" not in fn.lower():
+                allfiles.append(os.path.join(root, fn))
+    for fpath in sorted(allfiles):
+        fname = os.path.basename(fpath)
+        rel = os.path.relpath(fpath, memdir).replace("\\", "/")
         text = io.open(fpath, encoding="utf-8", errors="ignore").read()
         t = _guess_time(fname, fpath)
         for i, (head, body) in enumerate(_split_blocks(text)):
@@ -819,8 +825,8 @@ def build_index(memdir, outpath=None):
             if len(body.strip()) < 12:
                 continue
             e = {
-                "id": "%s#%d" % (os.path.splitext(fname)[0], i),
-                "source": fname,
+                "id": "%s#%d" % (os.path.splitext(rel)[0], i),
+                "source": rel,
                 "anchor": hashlib.sha1(body.strip()[:80].encode("utf-8")).hexdigest()[:12],
                 "time": t["time"], "date": t["date"], "period": t["period"],
                 "hour": hh if hh is not None else t["hour"],
