@@ -70,14 +70,48 @@ public class MemoryInjectModule(
 
     DateTime lastMaintain = DateTime.MinValue;
 
+    // 判断目录里有没有记忆文件（.md/.txt，递归；跳过 settled/backup/.bak）
+    static bool HasMemoryFiles(string dir)
+    {
+        try
+        {
+            if (!Directory.Exists(dir)) return false;
+            foreach (string f in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories))
+            {
+                string name = Path.GetFileName(f).ToLowerInvariant();
+                if (name.EndsWith(".bak")) continue;
+                string full = f.Replace('\\', '/').ToLowerInvariant();
+                if (full.Contains("/settled/") || full.Contains("/backup/")) continue;
+                if (name.EndsWith(".md") || name.EndsWith(".txt")) return true;
+            }
+        }
+        catch { }
+        return false;
+    }
+
+    // 解析记忆目录：配置路径存在就用它；否则按候选顺序自动探测，兼容不同角色的目录结构
+    string ResolveMemoryRoot(string roleRoot, string configuredRoot)
+    {
+        if (Directory.Exists(configuredRoot) && HasMemoryFiles(configuredRoot)) return configuredRoot;
+        string[] cands = { "Memory", "Storage/Memory", "Storage", "" };
+        foreach (string c in cands)
+        {
+            string norm = c.Replace('/', Path.DirectorySeparatorChar);
+            string cand = string.IsNullOrEmpty(norm) ? roleRoot : Path.Combine(roleRoot, norm);
+            if (HasMemoryFiles(cand)) return cand;
+        }
+        return configuredRoot;
+    }
+
     protected override Task OnAwake()
     {
         try
         {
+            string roleRoot = Path.Combine(AlifePath.StorageFolderPath, Character.StorageKey);
             string sub = (Configuration?.MemorySubPath ?? "Storage/Memory")
                 .Replace('/', Path.DirectorySeparatorChar)
                 .Replace('\\', Path.DirectorySeparatorChar);
-            memoryRoot = Path.Combine(AlifePath.StorageFolderPath, Character.StorageKey, sub);
+            memoryRoot = ResolveMemoryRoot(roleRoot, Path.Combine(roleRoot, sub));
             // 不写死目录名：先试本插件目录、再退回旧名，谁在就用谁，避免改名后静默找不到脚本
             {
                 string pluginsRoot = Path.Combine(AlifePath.StorageFolderPath, "Plugins");
