@@ -834,14 +834,16 @@ public class MemoryInjectModule(
         }
 
         // 找出没整理过的记忆文件（跳过事实卡本身、索引、状态文件）
-        var fresh = new List<(string path, string key, string text)>();
+        var fresh = new List<(string path, string key, string text, DateTime mt)>();
         int budget = Math.Max(2000, Configuration.LlmOrganizeMaxChars);
         try
         {
             foreach (string f in EnumerateMemoryFiles(memoryRoot))
             {
                 string name = Path.GetFileName(f);
-                if (name.StartsWith("事实_") || name == "index.json" || name.EndsWith("记忆索引视图.html")) continue;
+                if (name.StartsWith("事实_") || name.StartsWith("审计报告_")
+                    || name == "index.json" || name == "llm_organize_state.txt"
+                    || name == "compacted_sources.txt" || name.EndsWith("记忆索引视图.html")) continue;
                 string relPath = f.Substring(memoryRoot.Length).Replace('\\', '/').TrimStart('/');
                 if (pendingCompact.Count > 0 && pendingCompact.Contains(relPath)) continue;   // 留给压缩
                 DateTime mt;
@@ -851,13 +853,16 @@ public class MemoryInjectModule(
                 string txt;
                 try { txt = File.ReadAllText(f); } catch { continue; }
                 if (string.IsNullOrWhiteSpace(txt)) { done.Add(key); continue; }
-                if (txt.Length > budget) txt = txt.Substring(0, budget);
-                fresh.Add((f, key, txt));
+                // ★超预算就跳过这一份，绝不 break：否则老文件把预算吃光，新档永远轮不到
+                if (txt.Length > budget) continue;
+                fresh.Add((f, key, txt, mt));
                 budget -= txt.Length;
-                if (budget <= 0) break;
             }
         }
         catch (Exception e) { logger.LogWarning(e, "记忆书签：模型整理扫描失败"); return; }
+
+        // ★按修改时间从新到旧：新流水优先，别让老文件把预算耗光
+        fresh.Sort((x, y) => y.mt.CompareTo(x.mt));
 
         if (fresh.Count == 0) return;
 
@@ -900,7 +905,8 @@ public class MemoryInjectModule(
         try
         {
             // 只留最近 500 条水位，别无限长
-            var tail = done.Count > 500 ? done.Skip(done.Count - 500).ToList() : done.ToList();
+            var tail = done.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList();
+            if (tail.Count > 500) tail = tail.Skip(tail.Count - 500).ToList();
             File.WriteAllLines(llmStatePath, tail);
         }
         catch (Exception e) { logger.LogWarning(e, "记忆书签：模型整理水位写盘失败"); }
