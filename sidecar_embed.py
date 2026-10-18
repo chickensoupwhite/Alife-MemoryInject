@@ -9,8 +9,8 @@
 
 embed 用模型：BAAI/bge-small-zh-v1.5（512 维，中文短文本）。
 recall  纯标准库：读 index.json，按 人/事/物 标签打分，输出书签文本。
-        ★add-only 原则：命中只往消息末尾"追加"提示，绝不改写历史/不塞整句，
-          以免击穿前缀缓存（参考 livingmemory 的 extra_user_content 注入）。
+        ★只追加：命中只往本轮消息末尾追加提示，用户原话一字不动、不塞整句，
+          以免击穿前缀缓存（只动末尾、前缀不变）。
 两者互不依赖——模型没就绪时 recall 照常可用；索引没就绪时 embed 照常可用。
 """
 import sys
