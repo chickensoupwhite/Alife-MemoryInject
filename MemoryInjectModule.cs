@@ -438,8 +438,8 @@ public class MemoryInjectModule(
             string? bookmarks = sidecar.RecallSync(stripped, waitMs, indexPath, Configuration.HalfLifeDays, Configuration.UseGraph, Configuration.SkipRecentDays);
             if (string.IsNullOrWhiteSpace(bookmarks) == false)
             {
-                // ★add-only 原则：只在本条消息末尾"追加"临时书签，绝不改写原 message、
-                //   不往历史里写。参考 livingmemory 的 extra_user_content 注入（防击穿前缀缓存）。
+                // ★只追加：书签拼在本轮用户消息末尾，用户原话一字不动。
+                //   框架 ChatSend 的返回值即本轮新消息内容（会进历史），前缀不变，前缀缓存照常命中。
                 string tail = Configuration.ToolFirst
                     ? "\n[要用全文：调 <memfetch source=\"出处文件名\"/> 或 <memwhen time=\"上周三\"/>，不要扫盘、不要凭印象编。]"
                     : "\n[要用全文：去 " + memoryRoot + " 翻对应那份，别凭印象编。]";
