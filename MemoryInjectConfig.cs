@@ -43,7 +43,7 @@ public class MemoryInjectConfig
     public double MinScoreKeyword { get; set; } = 0.15;
 
     [DisplayName("忽略最近几天内的文件")]
-    [Description("最近 N 天内的记忆文件不参与检索（那些内容本来就在眼前）。0 = 不忽略。默认 1。")]
+    [Description("只作用于自动书签：按条目的日期跳过最近 N 天（不是文件修改时间）；手动调 memrecall/memwhen 永不跳过。0 = 不忽略。默认 1。")]
     public int SkipRecentDays { get; set; } = 1;
 
     [DisplayName("最短检索字符数")]
@@ -90,8 +90,83 @@ public class MemoryInjectConfig
     [Description("一条记忆切成多大块：切得细召回准、切得粗索引小。改动后需重建索引。建议 200。")]
     public int BlockMaxChars { get; set; } = 200;
 
+    [DisplayName("自动整理间隔（分钟）")]
+    [Description("后台每隔这么久检查一次记忆目录：有了新记忆文件就自动并进索引，不用手动点重建。建议 10。")]
+    public int AutoOrganizeMinutes { get; set; } = 10;
+
+    [DisplayName("手动排除的来源（每行一个）")]
+    [Description("相对路径或目录前缀，例如 L1/ 排掉整个 L1；L1/xxx.txt 排掉单个文件。官方文件不会被删除，只是不进我们的索引。")]
+    public string ExcludeSources { get; set; } = "";
+
+    [DisplayName("首次迁移旧索引")]
+    [Description("开：首次启动把官方目录里的旧 index.json 复制过来导入；关：直接按现有记忆文件重建新库。默认开。")]
+    public bool MigrateOldIndex { get; set; } = true;
+
+    [DisplayName("启用模型整理")]
+    [Description("让模型定期读新落盘的记忆流水，提炼成事实卡落盘（原文不动）。关了就只走原来的文件级整理。")]
+    public bool LlmOrganizeEnable { get; set; } = true;
+
+    [DisplayName("模型整理间隔（分钟）")]
+    [Description("后台每隔这么久让模型整理一次新记忆。建议 120（两小时）。")]
+    public int LlmOrganizeMinutes { get; set; } = 120;
+
+    [DisplayName("模型整理单次上限（字）")]
+    [Description("单次喂给模型的新记忆最多多少字，超了截断。建议 30000。")]
+    public int LlmOrganizeMaxChars { get; set; } = 30000;
+
+    [DisplayName("提示里强调先调工具")]
+    [Description("打开后，命中提示会明确要求模型先用 memrecall / memfetch / memwhen 查，而不是自己去翻磁盘。建议开。")]
+    public bool ToolFirst { get; set; } = true;
+
+    [DisplayName("按时间查默认条数")]
+    [Description("memwhen 不指定条数时默认返回几条。建议 8。")]
+    public int WhenLimit { get; set; } = 8;
+
+    [DisplayName("工具结果回显到聊天框")]
+    [Description("打开后，工具查到的内容也会 Poke 进聊天框（截断到 400 字）。模型同轮已能拿到返回值，这主要是给人看的。建议开。")]
+    public bool EchoToolResult { get; set; } = true;
+
+    [DisplayName("事实合并阈值")]
+    [Description("新事实与已有事实（同主体同类别）相似度达到这里就合并，低于则新增。0.5 左右比较合适。")]
+    public double MergeThreshold { get; set; } = 0.5;
+
+    [DisplayName("启用自动压缩")]
+    [Description("把条目多、够旧的流水文件交给模型压成事实卡；只标记为「已压缩」（不进索引），官方文件不动。默认关。")]
+    public bool AutoCompactEnable { get; set; } = false;
+
+    [DisplayName("自动压缩间隔（分钟）")]
+    [Description("后台每隔这么久检查一次可压缩的流水。建议 360（六小时）。")]
+    public int AutoCompactMinutes { get; set; } = 360;
+
+    [DisplayName("压缩门槛：至少多少条")]
+    [Description("一个流水文件至少被切成这么多条才值得压。建议 30。")]
+    public int AutoCompactMinEntries { get; set; } = 30;
+
+    [DisplayName("压缩门槛：至少多旧（天）")]
+    [Description("最近这么多天内的流水不压（还在用）。建议 7。")]
+    public int AutoCompactMinAgeDays { get; set; } = 7;
+
+    [DisplayName("压缩单次上限（字）")]
+    [Description("一次喂给模型最多多少字。建议 20000。")]
+    public int AutoCompactMaxChars { get; set; } = 20000;
+
+
+    [DisplayName("启用事实审计")]
+    [Description("后台定期扫事实卡里的重复/可能矛盾，写审计报告（只报告，不自动改）。建议开。")]
+    public bool AuditEnable { get; set; } = true;
+
+    [DisplayName("审计间隔（分钟）")]
+    [Description("后台每隔这么久审一次。建议 120（两小时）。")]
+    public int AuditMinutes { get; set; } = 120;
+
+    [DisplayName("审计单次最多列几条")]
+    [Description("一份报告最多列多少条问题。建议 30。")]
+    public int AuditLimit { get; set; } = 30;
+
     [DisplayName("提示文本")]
-    [Description("命中后追加到消息末尾的提示。{n} 替换成命中条数，{files} 替换成命中的文件，{path} 替换成记忆目录。")]
+    [Description("命中后追加到消息末尾的提示。{n} 命中条数、{files} 命中文件、{path} 记忆目录。")]
     public string HintTemplate { get; set; } =
-        "[回忆提示：Memory 里可能有 {n} 条旧账跟这句相关（{files}）。若这句话牵涉往事，先去 {path} 翻一翻再答，别凭印象编。]";
+        "[回忆提示：Memory 里可能有 {n} 条旧账跟这句相关（{files}）。要查往事就先调工具，别扫盘：" +
+        "<memrecall query=\"关键词\"/> 查书签、<memfetch source=\"出处文件名\"/> 取原文、" +
+        "<memwhen time=\"上周三\"/> 按时间翻；工具都查不到，再考虑看目录 {path}。]";
 }
