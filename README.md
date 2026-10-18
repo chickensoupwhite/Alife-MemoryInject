@@ -102,7 +102,8 @@
 ## 参考与致谢
 
 - **memcore**（misaka-coder，Apache-2.0）—— 借鉴 **RRF 排名融合**、**指数半衰期衰减**、**时间锚点**。
-- **livingmemory / astrbot_plugin_livingmemory**（lxfight-s，AGPL-3.0）—— 借鉴 **add-only 注入原则**、**记忆生命周期三段式**、**图谱路**。
+- **livingmemory / astrbot_plugin_livingmemory**（lxfight-s，AGPL-3.0）—— 借鉴 **add-only 注入原则**、**记忆生命周期三段式**。
+- **Obsidian 双链结构** —— 索引组织思路来自主人定的「三件套」：**文件夹＝"事"、标签＝"人"和"物"、双链＝关联**；图谱边就照这套建（节点是人/事/物，边带类型）。
 - **Alife.Function.Memory**（Alife 官方）—— 复用同款向量模型与侧车交互范式。
 
 特别感谢以上作者把思路公开出来。**思想不受版权约束，借鉴的是思路；若有代码层面的相似之处，以各自许可证为准。** 本插件采用 MIT 许可。
