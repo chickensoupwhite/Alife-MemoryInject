@@ -4,6 +4,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -223,11 +224,11 @@ public sealed class EmbedSidecar : IAsyncDisposable
     /// 侧车常驻后单次约十几毫秒；超时或未就绪立刻返回 null，绝不死等、绝不外抛。
     /// 走 Task.Run 隔离，不会把同步钩子所在的 UI 线程拖死。
     /// </summary>
-    public string? RecallSync(string query, int waitMs, string? indexPath = null, double? halfLife = null, bool? useGraph = null)
+    public string? RecallSync(string query, int waitMs, string? indexPath = null, double? halfLife = null, bool? useGraph = null, int skipRecentDays = 0)
     {
         if (IsReady == false || Busy || process == null || process.HasExited) return null;
         int budget = Math.Max(waitMs, 20);
-        Task<string?> t = Task.Run(() => RecallAsync(query, budget * 4, indexPath, halfLife, useGraph));
+        Task<string?> t = Task.Run(() => RecallAsync(query, budget * 4, indexPath, halfLife, useGraph, skipRecentDays));
         try
         {
             if (t.Wait(budget) == false) return null;
@@ -240,7 +241,7 @@ public sealed class EmbedSidecar : IAsyncDisposable
     }
 
     /// <summary>异步召回：发 recall 请求给侧车、拿书签文本；失败返回 null。</summary>
-    public async Task<string?> RecallAsync(string query, int timeoutMs = 800, string? indexPath = null, double? halfLife = null, bool? useGraph = null)
+    public async Task<string?> RecallAsync(string query, int timeoutMs = 800, string? indexPath = null, double? halfLife = null, bool? useGraph = null, int skipRecentDays = 0)
     {
         if (IsReady == false || process == null || process.HasExited) return null;
         int id = Interlocked.Increment(ref nextId);
@@ -249,7 +250,68 @@ public sealed class EmbedSidecar : IAsyncDisposable
 
         try
         {
-            string payload = JsonSerializer.Serialize(new { id, fn = "recall", query, top_k = 5, index = indexPath ?? "", half_life = halfLife, use_graph = useGraph });
+            string payload = JsonSerializer.Serialize(new { id, fn = "recall", query, top_k = 5, index = indexPath ?? "", half_life = halfLife, use_graph = useGraph, skip_recent_days = skipRecentDays });
+            await writeLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                await stdin!.WriteLineAsync(payload.AsMemory()).ConfigureAwait(false);
+                await stdin.FlushAsync().ConfigureAwait(false);
+            }
+            finally { writeLock.Release(); }
+
+            Task done = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs)).ConfigureAwait(false);
+            if (done != tcs.Task)
+            {
+                pending.TryRemove(id, out _);
+                return null;
+            }
+
+            JsonElement root = await tcs.Task.ConfigureAwait(false);
+            if (root.TryGetProperty("ok", out JsonElement okEl) == false || okEl.GetBoolean() == false)
+                return null;
+            if (root.TryGetProperty("bookmarks", out JsonElement bmEl) == false)
+                return null;
+            string? s = bmEl.GetString();
+            return string.IsNullOrWhiteSpace(s) ? null : s;
+        }
+        catch
+        {
+            pending.TryRemove(id, out _);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 带时间维的召回：把 date_from/date_to/period/hour_from/hour_to 直接透传给侧车 recall。
+    /// 用于「上周三」「三天前」「昨晚」这类按时间翻旧账；返回书签文本，失败返回 null。
+    /// </summary>
+    public async Task<string?> RecallExAsync(string query, int timeoutMs = 3000, string? indexPath = null,
+        double? halfLife = null, bool? useGraph = null, int topK = 5,
+        string? dateFrom = null, string? dateTo = null, string? period = null,
+        int? hourFrom = null, int? hourTo = null)
+    {
+        if (IsReady == false || process == null || process.HasExited) return null;
+        int id = Interlocked.Increment(ref nextId);
+        TaskCompletionSource<JsonElement> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pending[id] = tcs;
+
+        try
+        {
+            string payload = JsonSerializer.Serialize(new
+            {
+                id,
+                fn = "recall",
+                query,
+                top_k = Math.Max(1, topK),
+                index = indexPath ?? "",
+                half_life = halfLife,
+                use_graph = useGraph,
+                date_from = dateFrom ?? "",
+                date_to = dateTo ?? "",
+                period = period ?? "",
+                hour_from = hourFrom,
+                hour_to = hourTo,
+            });
             await writeLock.WaitAsync().ConfigureAwait(false);
             try
             {
@@ -284,7 +346,8 @@ public sealed class EmbedSidecar : IAsyncDisposable
     /// 后台重建索引：请侧车扫描记忆目录、重写 index.json，并清掉自己的索引缓存。
     /// 重建慢，调用方一律放后台；超时/失败返回 null，绝不外抛。
     /// </summary>
-    public async Task<(int count, string outPath)?> BuildAsync(string memdir, string? outPath = null, int timeoutMs = 60000, int? blockMax = null)
+    public async Task<(int count, string outPath)?> BuildAsync(string memdir, string? outPath = null, int timeoutMs = 60000, int? blockMax = null,
+        IEnumerable<string>? extra = null, IEnumerable<string>? exclude = null)
     {
         if (IsReady == false || process == null || process.HasExited) return null;
         if (string.IsNullOrWhiteSpace(memdir)) return null;
@@ -295,7 +358,12 @@ public sealed class EmbedSidecar : IAsyncDisposable
 
         try
         {
-            string payload = JsonSerializer.Serialize(new { id, fn = "build", memdir, @out = outPath ?? "", block_max = blockMax });
+            string payload = JsonSerializer.Serialize(new
+            {
+                id, fn = "build", memdir, @out = outPath ?? "", block_max = blockMax,
+                extra = extra?.ToArray() ?? Array.Empty<string>(),
+                exclude = exclude?.ToArray() ?? Array.Empty<string>(),
+            });
             await writeLock.WaitAsync().ConfigureAwait(false);
             try
             {
@@ -347,7 +415,14 @@ public sealed class EmbedSidecar : IAsyncDisposable
     }
 
     /// <summary>异步版通用查询：发 fn + args 给侧车，取回 text 字段。</summary>
-    public async Task<string?> AskAsync(string fn, Dictionary<string, object?> args, int timeoutMs = 3000, string? indexPath = null)
+    public Task<string?> AskAsync(string fn, Dictionary<string, object?> args, int timeoutMs = 3000, string? indexPath = null)
+        => AskFieldAsync(fn, args, "text", timeoutMs, indexPath);
+
+    /// <summary>
+    /// 异步取整个回包（compactscan / auditscan / browse 这类结构化结果要用整包）。
+    /// 超时或 ok=false 返回 null。
+    /// </summary>
+    public async Task<JsonElement?> AskJsonAsync(string fn, Dictionary<string, object?> args, int timeoutMs = 5000, string? indexPath = null)
     {
         if (IsReady == false || process == null || process.HasExited) return null;
 
@@ -378,16 +453,27 @@ public sealed class EmbedSidecar : IAsyncDisposable
             JsonElement root = await tcs.Task.ConfigureAwait(false);
             if (root.TryGetProperty("ok", out JsonElement okEl) == false || okEl.GetBoolean() == false)
                 return null;
-            if (root.TryGetProperty("text", out JsonElement txEl) == false)
-                return null;
-            string? s = txEl.GetString();
-            return string.IsNullOrWhiteSpace(s) ? null : s;
+            return root.Clone();
         }
         catch
         {
             pending.TryRemove(id, out _);
             return null;
         }
+    }
+
+    /// <summary>
+    /// 异步版通用查询（指定字段）：bytime 返回 bookmarks、stats 返回 count/first/last，
+    /// 不能一律取 text。超时/失败返回 null，绝不死等、绝不外抛。
+    /// </summary>
+    public async Task<string?> AskFieldAsync(string fn, Dictionary<string, object?> args, string field, int timeoutMs = 3000, string? indexPath = null)
+    {
+        JsonElement? root = await AskJsonAsync(fn, args, timeoutMs, indexPath).ConfigureAwait(false);
+        if (root == null) return null;
+        if (root.Value.TryGetProperty(field, out JsonElement el) == false) return null;
+        // 兼容数值字段（stats 的 count）：非字符串时用原始文本
+        string? s = el.ValueKind == JsonValueKind.String ? el.GetString() : el.ToString();
+        return string.IsNullOrWhiteSpace(s) ? null : s;
     }
 
     public async ValueTask DisposeAsync()
