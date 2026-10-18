@@ -86,8 +86,10 @@ def _find_index():
 
 def _set_index(path):
     """切换当前使用的索引文件（多角色各自一份，不打架）。
-    命中分桶缓存就直接用热的，避免多角色来回切时反复冷读。"""
-    if path and os.path.isfile(path) and _IDX.get("path") != path:
+    命中分桶缓存就直接用热的，避免多角色来回切时反复冷读。
+    ★显式路径即使文件暂时不在也要记下来：绝不回退到别人的索引。"""
+    if path and _IDX.get("path") != path:
+        _GRAPH["built"] = False      # ★换索引=换图：不清就会拿上一个角色的图去扩词
         _IDX["path"] = path
         c = _CACHE.get(path)
         if c is not None:
@@ -104,16 +106,30 @@ def _set_index(path):
 
 
 def _load_index():
-    """加载索引（带缓存）。找不到就返回空表，不抛异常。"""
-    if _IDX["data"] is None:
-        p = _IDX["path"] or _find_index()
+    """加载索引（带缓存）。显式路径给了但文件不在 → 返回空表，绝不回退到别人的索引。"""
+    p = _IDX["path"]
+    if p is None:
+        p = _find_index()
         _IDX["path"] = p
-        if p:
-            with open(p, encoding="utf-8") as f:
-                _IDX["data"] = json.load(f)
+    # ★数据库优先：建过库就以库为准（JSON 只用于首次迁移/导出）
+    try:
+        if p and _DB.get("ok") and _IDX["data"] is None:
+            rows = db_load_all(p)
+            if rows is not None:
+                _IDX["data"] = rows
+                return rows
+    except Exception:
+        pass
+    if _IDX["data"] is None:
+        if p and os.path.isfile(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    _IDX["data"] = json.load(f)
+            except Exception:
+                _IDX["data"] = []
+            _cache_put(_IDX["path"], "data", _IDX["data"])
         else:
-            _IDX["data"] = []
-        _cache_put(_IDX["path"], "data", _IDX["data"])
+            return []   # 显式路径缺失：空表，不缓存，等 build 出来再读
     return _IDX["data"]
 
 
@@ -315,7 +331,7 @@ def parse_time_hint(text):
 
 
 def recall(query, top_k=5, min_ratio=0.45, date_from=None, date_to=None, period=None,
-           hour_from=None, hour_to=None, use_graph=True):
+           hour_from=None, hour_to=None, use_graph=True, skip_recent_days=0):
     """
     召回：输入一句中文，返回命中的记忆条目（按相关度倒序）。
     打分 = 字段权重（标签3>标题3>摘要2>正文1）× 词权重（IDF，常见词降权）。
@@ -330,6 +346,9 @@ def recall(query, top_k=5, min_ratio=0.45, date_from=None, date_to=None, period=
     if not terms:
         return []
     data = [e for e in _load_index() if not e.get("retired")]
+    if int(skip_recent_days or 0) > 0:
+        _cut = (datetime.date.today() - datetime.timedelta(days=int(skip_recent_days))).isoformat()
+        data = [e for e in data if not (e.get("date") or "") or str(e.get("date")) < _cut]
     if date_from or date_to or period or hour_from is not None or hour_to is not None:
         def _ok(e):
             d = str(e.get("date") or "")
@@ -378,8 +397,10 @@ def recall(query, top_k=5, min_ratio=0.45, date_from=None, date_to=None, period=
         gexp = graph_expand(query, terms) if use_graph else []
         if gexp:
             for e in data:
+                # ★以前只匹配 people/topics/things，实体节点等于白建；正文/标题/摘要也一起匹配
                 etags = " ".join([_field_text(e, "people"), _field_text(e, "topics"),
-                                  _field_text(e, "things")]).lower()
+                                  _field_text(e, "things"), _field_text(e, "head"),
+                                  _field_text(e, "summary"), _field_text(e, "text")]).lower()
                 gh = [g for g in gexp if g.lower() in etags]
                 if gh:
                     scored.append((0.2 * len(gh), len(gh), e.get("time") or "", e))
@@ -476,6 +497,9 @@ def _flush_life():
     import time as _t
     if not _LIFE["dirty"]:
         return
+    if _DB.get("ok"):
+        _LIFE["dirty"] = False
+        return          # 数据库模式：生命周期已直接 UPDATE 到库，不再回写 JSON
     now = _t.time()
     if now - _LIFE["last_write"] < 20:
         return
@@ -595,6 +619,10 @@ def build_graph():
             for x in (e.get(field) or []):
                 if x:
                     ns.append(str(x))
+        # ⑤ 正文实体（规则抽取，不上模型）：并进同一张图，节点比"只有标签"多一层
+        ent_text = "%s %s %s" % (e.get("head") or "", e.get("summary") or "", str(e.get("text") or "")[:400])
+        for x in extract_entities(ent_text)[:6]:
+            ns.append(x)
         ns = list(dict.fromkeys(ns))
         for n in ns:
             nodes[n] = nodes.get(n, 0) + 1
@@ -642,6 +670,35 @@ def graph_expand(query, terms, top=6):
                 expanded[nb] = expanded.get(nb, 0) + w
     ranked = sorted(expanded.items(), key=lambda x: x[1], reverse=True)
     return [n for n, _ in ranked[:top]]
+
+
+def links(query, top=6, max_seed=3):
+    """图谱邻居：某个节点跟谁常一起出现。给 AI 顺着关系找线索用（不是只做隐式扩词）。"""
+    if not _GRAPH["built"]:
+        build_graph()
+    q = (query or "").strip().lower()
+    seeds = []
+    if q:
+        for n in _GRAPH["nodes"]:
+            nl = n.lower()
+            if nl in q or (len(nl) >= 2 and q in nl):
+                seeds.append(n)
+    seeds.sort(key=lambda n: -_GRAPH["nodes"].get(n, 0))
+    seeds = seeds[:max(1, int(max_seed))]
+    items = []
+    for s in seeds:
+        items.append({
+            "node": s,
+            "count": _GRAPH["nodes"].get(s, 0),
+            "neighbors": [{"name": n, "w": w} for n, w in _neighbors(s, top)],
+        })
+    if not items:
+        return {"seeds": [], "items": [], "text": ""}
+    lines = []
+    for it in items:
+        nb = "、".join("%s(%d)" % (x["name"], x["w"]) for x in it["neighbors"]) or "（没有邻居）"
+        lines.append("- %s：出现 %d 次；常一起出现 → %s" % (it["node"], it["count"], nb))
+    return {"seeds": seeds, "items": items, "text": "\n".join(lines)}
 
 
 # ===== 可视化：把索引导成一页 HTML（本地打开看） =====
@@ -849,24 +906,45 @@ def _first_sent(body):
     return ""
 
 
-def build_index(memdir, outpath=None):
-    """扫描记忆目录，重建 index.json。返回 (条数, 输出路径)。"""
+def build_index(memdir, outpath=None, extra_dirs=None, exclude=None):
+    """扫描记忆目录重建 index.json。
+    extra_dirs：额外目录（我们自己的事实层），其 source 统一加 facts/ 前缀；
+    exclude：要跳过的相对路径（已压缩的官方存档，只是不建索引，文件原样保留）。"""
     import hashlib
     if not memdir or not os.path.isdir(memdir):
         raise RuntimeError("记忆目录不存在：" + str(memdir))
     if not outpath:
         outpath = os.path.join(_HERE, "index.json")
+    # 读旧索引：按 anchor 保留生命周期字段（access_count/last_access/retired），
+    # 让"自动整理"重建时不丢"访问强化/衰减/软删"状态。
+    old = {}
+    if os.path.exists(outpath):
+        try:
+            for _e in json.load(io.open(outpath, encoding="utf-8")):
+                _a = _e.get("anchor")
+                if _a:
+                    old[_a] = _e
+        except Exception:
+            old = {}
     entries = []
+    skip_dirs = {"settled", "backup", "备份", "archive", "MemoryFacts"}
+    ex = set(str(x).replace("\\", "/") for x in (exclude or []))
+    jobs = [(memdir, "")]
+    for d in (extra_dirs or []):
+        if d and os.path.isdir(d):
+            jobs.append((d, "facts/"))
     allfiles = []
-    skip_dirs = {"settled", "backup", "备份"}
-    for root, dirs, _files in os.walk(memdir):
-        dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith(".")]
-        for fn in _files:
-            if fn.lower().endswith((".md", ".txt")) and ".bak" not in fn.lower():
-                allfiles.append(os.path.join(root, fn))
-    for fpath in sorted(allfiles):
+    for base, prefix in jobs:
+        for root, dirs, _files in os.walk(base):
+            dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith(".")]
+            for fn in _files:
+                if fn.lower().endswith((".md", ".txt")) and ".bak" not in fn.lower():
+                    allfiles.append((os.path.join(root, fn), base, prefix))
+    for fpath, base, prefix in sorted(allfiles, key=lambda x: x[0]):
         fname = os.path.basename(fpath)
-        rel = os.path.relpath(fpath, memdir).replace("\\", "/")
+        rel = prefix + os.path.relpath(fpath, base).replace("\\", "/")
+        if prefix == "" and _is_excluded(rel, ex):
+            continue        # 已压缩/手动排除：只跳过索引，官方文件一个字节都不动
         text = io.open(fpath, encoding="utf-8", errors="ignore").read()
         t = _guess_time(fname, fpath)
         for i, (head, body) in enumerate(_split_blocks(text)):
@@ -884,9 +962,20 @@ def build_index(memdir, outpath=None):
                 "access_count": 0, "last_access": "",
             }
             e.update(_tag(head + "\n" + body))
+            # 保留生命周期：同一 anchor（内容指纹）的旧条目，沿用其访问计数/软删状态
+            _prev = old.get(e["anchor"])
+            if _prev:
+                e["access_count"] = _prev.get("access_count", 0)
+                e["last_access"] = _prev.get("last_access", "")
+                if _prev.get("retired"):
+                    e["retired"] = _prev["retired"]
+                    e["retired_at"] = _prev.get("retired_at")
             entries.append(e)
     io.open(outpath, "w", encoding="utf-8").write(json.dumps(entries, ensure_ascii=False, indent=1))
     # 索引变了：清缓存，下次查询重新读盘
+    _GRAPH["built"] = False          # ★索引重建后图谱也必须重建，否则 links/graph_expand 用旧图
+    _GRAPH["nodes"] = {}
+    _GRAPH["edges"] = {}
     _IDX["data"] = None
     _IDX["vocab"] = None
     _IDX["df"] = None
@@ -976,6 +1065,397 @@ _MODEL = {"ready": False, "tok": None, "mdl": None, "device": "unavailable",
 _VEC_CACHE = {}
 
 
+def bytime(date_from=None, date_to=None, period=None, hour_from=None, hour_to=None, top_k=10):
+    """按时间范围列记忆（不要求关键词）：日/时段/小时都能下钻，按时间倒序返回。"""
+    data = [e for e in _load_index() if not e.get("retired")]
+
+    def _ok(e):
+        d = str(e.get("date") or "")
+        if date_from and d and d < date_from:
+            return False
+        if date_to and d and d > date_to:
+            return False
+        if period and period not in str(e.get("period") or ""):
+            return False
+        if hour_from is not None or hour_to is not None:
+            h = e.get("hour")
+            if h is not None:
+                if hour_from is not None and h < hour_from:
+                    return False
+                if hour_to is not None and h > hour_to:
+                    return False
+        return True
+
+    data = [e for e in data if _ok(e)]
+    data.sort(key=lambda e: str(e.get("time") or ""), reverse=True)
+    return data[:max(1, int(top_k or 10))]
+
+
+def bywhen(text, keyword=None, top_k=8, use_graph=True):
+    """一句中文时间词 -> 那段时间的记忆。「上周三」「三天前」「昨晚」都行；给关键词就按相关度排。"""
+    df, dt, pd = parse_time_hint(text or "")
+    if keyword:
+        hits = recall(keyword, top_k=top_k, date_from=df, date_to=dt, period=pd, use_graph=use_graph)
+    else:
+        hits = bytime(date_from=df, date_to=dt, period=pd, top_k=top_k)
+    return {
+        "bookmarks": to_bookmarks(hits),
+        "count": len(hits),
+        "date_from": df or "",
+        "date_to": dt or "",
+        "period": pd or "",
+        "text": "%s ~ %s%s 共 %d 条" % (df or "?", dt or "?", (" " + pd) if pd else "", len(hits)),
+    }
+
+
+def index_stats():
+    """索引体量与时间跨度，供 memstatus 用。"""
+    data = [e for e in _load_index() if not e.get("retired")]
+    dates = sorted({str(e.get("date") or "") for e in data if e.get("date")})
+    return {"count": len(data), "first": dates[0] if dates else "", "last": dates[-1] if dates else ""}
+
+
+# ============================================================
+# ① 自动压缩 / ② 审计 / ③ 写入合并 / ⑤ 实体图谱 / ⑥ 浏览
+# ============================================================
+
+def _tokens(text):
+    """粗粒度 token（中文按 2-gram、英文按词），只用于相似度比较。"""
+    s = re.sub(r"[^\w\u4e00-\u9fff]+", " ", str(text or ""))
+    out = set()
+    for w in s.split():
+        if len(w) <= 2:
+            out.add(w)
+        else:
+            for i in range(len(w) - 1):
+                out.add(w[i:i + 2])
+    return out
+
+
+def _jaccard(a, b):
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    uni = len(a | b)
+    return (inter / float(uni)) if uni else 0.0
+
+
+def _sim(a, b):
+    """事实相似度：Jaccard 与"包含度"取大。
+    短句（如「血压偏高」vs「血压还是偏高些」）Jaccard 会被稀释，包含度能抓住。"""
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    if inter == 0:
+        return 0.0
+    j = inter / float(len(a | b))
+    c = inter / float(min(len(a), len(b)))
+    return max(j, c * 0.9)
+
+
+# ---------- ① 自动压缩 ----------
+
+def compact_scan(memdir, min_entries=30, min_age_days=7, max_chars=20000, top_k=8, exclude=None):
+    """找可压缩的流水文件：条目多、够旧。返回候选（含要喂给模型的正文）。
+    ★不动原文：这里只给候选，C# 侧提炼、归档、重建索引。"""
+    groups = {}
+    for e in _load_index():
+        if e.get("retired"):
+            continue
+        src = str(e.get("source") or "")
+        if not src:
+            continue
+        groups.setdefault(src, []).append(e)
+    today = datetime.date.today()
+    ex = set(str(x).replace("\\", "/") for x in (exclude or []))
+    cands = []
+    for src, items in groups.items():
+        if _is_excluded(src, ex) or src.startswith("facts/"):
+            continue        # 已压缩过 / 手动排除 / 我们自己的事实层，都不再压
+        if len(items) < int(min_entries):
+            continue
+        dates = sorted(str(x.get("date") or "") for x in items if x.get("date"))
+        age = 0
+        if dates:
+            try:
+                age = (today - datetime.date.fromisoformat(dates[-1])).days
+            except Exception:
+                age = 0
+        if age < int(min_age_days):
+            continue
+        items.sort(key=lambda x: str(x.get("time") or ""))
+        parts, size = [], 0
+        for x in items:
+            who = "".join(x.get("people") or [])
+            topic = "".join(x.get("topics") or [])
+            summary = str(x.get("summary") or x.get("head") or "").strip()
+            line = " | ".join([str(x.get("date") or ""), who, topic, summary])
+            size += len(line)
+            if size > int(max_chars):
+                break
+            parts.append(line)
+        cands.append({
+            "source": src,
+            "entries": len(items),
+            "chars": size,
+            "date_from": dates[0] if dates else "",
+            "date_to": dates[-1] if dates else "",
+            "text": "\n".join(parts),
+        })
+    cands.sort(key=lambda c: (-c["entries"], c["date_from"]))
+    return cands[:max(1, int(top_k))]
+
+
+# ---------- ② 审计 ----------
+
+def _fact_files(memdir):
+    out = []
+    try:
+        for name in os.listdir(memdir):
+            if name.startswith("事实_") and name.endswith(".md"):
+                out.append(os.path.join(memdir, name))
+    except Exception:
+        pass
+    out.sort()
+    return out
+
+
+def _parse_fact(line):
+    """解析事实卡行：- 日期 | 涉及谁 | 属哪件事 | 一句话事实"""
+    s = str(line or "").strip()
+    if s.startswith("-"):
+        s = s[1:].strip()
+    if "|" not in s:
+        return None
+    parts = [p.strip() for p in s.split("|")]
+    if len(parts) < 4:
+        return None
+    return {"date": parts[0], "who": parts[1], "topic": parts[2], "fact": "|".join(parts[3:]).strip()}
+
+
+_NEG = ("没", "未", "不", "取消", "放弃", "作废")
+
+
+def audit_scan(memdir, limit=30, dup=0.85, near=0.5, max_facts=400):
+    """扫事实卡：重复 / 可能重复 / 可能矛盾，只出报告，不自动改。"""
+    facts = []
+    for path in _fact_files(memdir):
+        try:
+            with io.open(path, encoding="utf-8") as fh:
+                for ln in fh:
+                    f = _parse_fact(ln)
+                    if f:
+                        f["file"] = os.path.basename(path)
+                        f["line"] = ln.rstrip()
+                        facts.append(f)
+        except Exception:
+            continue
+    # ★只比最近的一批：事实卡上千条时 O(n^2) 会拖死侧车
+    if len(facts) > int(max_facts):
+        facts = facts[-int(max_facts):]
+    out = []
+    n = len(facts)
+    cap = max(1, int(limit)) * 3
+    for i in range(n):
+        if len(out) >= cap:
+            break
+        for j in range(i + 1, n):
+            a, b = facts[i], facts[j]
+            same_key = (a["who"] == b["who"] and a["topic"] == b["topic"])
+            sim = _sim(_tokens(a["fact"]), _tokens(b["fact"]))
+            kind = None
+            if sim >= float(dup):
+                kind = "重复"
+            elif same_key and sim >= float(near):
+                kind = "可能重复"
+            elif same_key:
+                na = any(w in a["fact"] for w in _NEG)
+                nb = any(w in b["fact"] for w in _NEG)
+                if na != nb:
+                    kind = "可能矛盾"
+            if kind:
+                out.append({
+                    "kind": kind,
+                    "score": round(sim, 3),
+                    "a": a["line"], "b": b["line"],
+                    "file_a": a["file"], "file_b": b["file"],
+                })
+    out.sort(key=lambda x: (0 if x["kind"] == "重复" else 1, -x["score"]))
+    return out[:max(1, int(limit))]
+
+
+# ---------- ③ 写入合并 ----------
+
+def fact_merge(new_lines, existing_text="", threshold=0.5):
+    """新事实入库前合并：同主体同类别里，重复的丢、相近的并、其余追加。"""
+    existing_text = existing_text or ""
+    out_lines = existing_text.splitlines()
+    existing = []
+    for ln in out_lines:
+        f = _parse_fact(ln)
+        if f:
+            f["line"] = ln.rstrip()
+            existing.append(f)
+    pos = {}
+    for i, ln in enumerate(out_lines):
+        pos.setdefault(ln.rstrip(), i)
+
+    added, merged, skipped = [], [], []
+    for raw in (new_lines or []):
+        raw = str(raw or "").strip()
+        if not raw:
+            continue
+        f = _parse_fact(raw)
+        if not f:
+            out_lines.append("- " + raw)
+            added.append(raw)
+            continue
+        best_i, best_s = -1, 0.0
+        for i, old in enumerate(existing):
+            if old["who"] != f["who"] or old["topic"] != f["topic"]:
+                continue
+            s = _sim(_tokens(old["fact"]), _tokens(f["fact"]))
+            if s > best_s:
+                best_s, best_i = s, i
+        if best_i >= 0 and best_s >= 0.85:
+            old = existing[best_i]
+            # 近似重复但新句子明显更详细：只刷新日期会丢掉新增信息 → 按"合并"保留更长的描述
+            if len(f["fact"]) >= len(old["fact"]) + 6:
+                keep = f["fact"]
+                date = max(f["date"], old["date"]) if (f["date"] and old["date"]) else (f["date"] or old["date"])
+                line = "- %s | %s | %s | %s" % (date, old["who"], old["topic"], keep)
+                k = pos.get(old["line"])
+                if k is not None:
+                    out_lines[k] = line
+                old["fact"] = keep
+                old["line"] = line
+                old["date"] = date
+                merged.append(line)
+                continue
+            # 同一事实再次出现：不重复入库，但把日期刷新到最新（旧事实不该永远停在老日期）
+            if f["date"] and f["date"] > old["date"]:
+                line = "- %s | %s | %s | %s" % (f["date"], old["who"], old["topic"], old["fact"])
+                k = pos.get(old["line"])
+                if k is not None:
+                    out_lines[k] = line
+                old["line"] = line
+                old["date"] = f["date"]
+            skipped.append(raw)
+            continue
+        if best_i >= 0 and best_s >= float(threshold):
+            old = existing[best_i]
+            keep = f["fact"] if len(f["fact"]) > len(old["fact"]) else old["fact"]
+            date = max(f["date"], old["date"]) if (f["date"] and old["date"]) else (f["date"] or old["date"])
+            line = "- %s | %s | %s | %s" % (date, old["who"], old["topic"], keep)
+            k = pos.get(old["line"])
+            if k is not None:
+                out_lines[k] = line
+            old["fact"] = keep
+            old["line"] = line
+            merged.append(line)
+            continue
+        line = "- %s | %s | %s | %s" % (f["date"], f["who"], f["topic"], f["fact"])
+        out_lines.append(line)
+        added.append(line)
+    return {
+        "text": "\n".join(out_lines),
+        "added": added,
+        "merged": merged,
+        "skipped": skipped,
+        "summary": "新增 %d，合并 %d，跳过重复 %d" % (len(added), len(merged), len(skipped)),
+    }
+
+
+# ---------- ⑤ 实体抽取（规则，不上模型） ----------
+
+_ENTITY_PATTERNS = [
+    re.compile(r"《([^》]{1,20})》"),
+    re.compile(r"「([^」]{1,20})」"),
+    re.compile(r"『([^』]{1,20})』"),
+    re.compile(r"([\u4e00-\u9fff]{2,6}(?:插件|项目|模型|客户端|服务|工具|游戏|软件))"),
+]
+
+_ENTITY_STOP = set(["什么", "这个", "那个", "我们", "他们", "自己", "现在", "今天", "昨天", "明天"])
+
+
+def extract_entities(text):
+    """从正文抽实体（书名号/引号/专名后缀/拉丁词），不用模型，避免吃显存。"""
+    t = str(text or "")
+    out = []
+    for rx in _ENTITY_PATTERNS:
+        for m in rx.finditer(t):
+            out.append((m.group(1) if m.groups() else m.group(0)).strip())
+    for m in re.finditer(r"[A-Za-z][A-Za-z0-9_.\-]{2,20}", t):
+        out.append(m.group(0))
+    seen, res = set(), []
+    for x in out:
+        x = x.strip(" 　,，。.;；:：")
+        if not x or len(x) < 2 or x in _ENTITY_STOP or x in seen:
+            continue
+        seen.add(x)
+        res.append(x)
+    return res
+
+
+# ---------- ⑥ 内嵌浏览 ----------
+
+def browse(query=None, who=None, topic=None, thing=None, date_from=None, date_to=None, offset=0, limit=50):
+    """给内嵌面板用：按关键词/人/事/物/时间翻条目，返回结构化列表 + 可直接显示的文本。"""
+    data = [e for e in _load_index() if not e.get("retired")]
+    q = (query or "").strip().lower()
+
+    def _hay(e):
+        # 只拼相关字段：比 json.dumps 整条便宜得多（3 万条时差别很明显）
+        return " ".join([
+            " ".join(e.get("people") or []),
+            " ".join(e.get("topics") or []),
+            " ".join(e.get("things") or []),
+            str(e.get("head") or ""),
+            str(e.get("summary") or ""),
+            str(e.get("text") or ""),
+        ]).lower()
+
+    def _ok(e):
+        if q and q not in _hay(e):
+            return False
+        if who and who not in (e.get("people") or []):
+            return False
+        if topic and topic not in (e.get("topics") or []):
+            return False
+        if thing and thing not in (e.get("things") or []):
+            return False
+        d = str(e.get("date") or "")
+        if date_from and d and d < date_from:
+            return False
+        if date_to and d and d > date_to:
+            return False
+        return True
+
+    hits = [e for e in data if _ok(e)]
+    hits.sort(key=lambda e: str(e.get("time") or ""), reverse=True)
+    total = len(hits)
+    off = max(0, int(offset or 0))
+    lim = max(1, min(200, int(limit or 50)))
+    items = []
+    for e in hits[off:off + lim]:
+        items.append({
+            "id": e.get("id") or "",
+            "date": e.get("date") or "",
+            "period": e.get("period") or "",
+            "head": (e.get("head") or "").lstrip("#").strip(),
+            "summary": e.get("summary") or "",
+            "source": e.get("source") or "",
+            "people": e.get("people") or [],
+            "topics": e.get("topics") or [],
+            "things": e.get("things") or [],
+        })
+    lines = []
+    for it in items:
+        label = "、".join(list(it["topics"]) + list(it["things"])) or it["head"] or "记忆"
+        lines.append("- [%s] %s：%s（出处 %s）" % (it["date"], label, it["summary"], it["source"]))
+    return {"total": total, "offset": off, "items": items, "text": "\n".join(lines)}
+
+
 def _settle_dir():
     base = os.path.dirname(_IDX.get("path") or _find_index() or "") or "."
     d = os.path.join(base, "settled")
@@ -1059,6 +1539,621 @@ def _cos(a, b):
         return 0.0
 
 
+# ============================================================
+# 数据库层（SQLite）：增量建库 + 按需查询
+#   - 条目主键用 id（source#块号），anchor 只做去重/水位参考
+#   - files 表按 mtime 做增量：只重扫变过的文件
+#   - vec 表缓存条目向量（float32 blob），避免每次重算
+#   - nodes/edges 表存互链（标签 + 正文实体共现）
+#   - JSON 仅用于首次迁移与 memview 导出；查询不走 JSON
+# ============================================================
+
+import sqlite3
+import struct
+import hashlib
+
+_DB = {"ok": False, "path": "", "conn": None}
+
+_DB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS entries(
+  id TEXT PRIMARY KEY, anchor TEXT, source TEXT,
+  time TEXT, date TEXT, period TEXT, hour INTEGER,
+  head TEXT, summary TEXT, body TEXT, hay TEXT,
+  people TEXT, topics TEXT, things TEXT,
+  access_count INTEGER DEFAULT 0, last_access TEXT,
+  retired INTEGER DEFAULT 0, retired_at TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_entries_time ON entries(time);
+CREATE INDEX IF NOT EXISTS ix_entries_source ON entries(source);
+CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, mtime REAL);
+CREATE TABLE IF NOT EXISTS vec(id TEXT PRIMARY KEY, data BLOB);
+CREATE TABLE IF NOT EXISTS nodes(name TEXT PRIMARY KEY, n INTEGER);
+CREATE TABLE IF NOT EXISTS edges(a TEXT, b TEXT, w INTEGER, type TEXT, PRIMARY KEY(a, b));
+"""
+
+
+def _is_excluded(rel, ex):
+    """排除判定：支持精确路径与目录前缀（以 / 结尾）。"""
+    r = (rel or "").replace("\\", "/")
+    if not r:
+        return False
+    for e in (ex or []):
+        e2 = str(e).replace("\\", "/")
+        if e2.endswith("/"):
+            if r.startswith(e2):
+                return True
+        elif r == e2:
+            return True
+    return False
+
+
+def _db_open(db_path):
+    try:
+        if not db_path:
+            return None
+        c = sqlite3.connect(db_path, timeout=15)
+        c.row_factory = sqlite3.Row
+        c.executescript(_DB_SCHEMA)
+        upgraded = False
+        try:
+            c.execute("ALTER TABLE edges ADD COLUMN type TEXT")
+            upgraded = True
+        except Exception:
+            pass
+        c.commit()
+        if upgraded:
+            try:
+                _db_rebuild_links(c)   # 旧库升级：重算一遍带类型的边
+                c.commit()
+            except Exception:
+                pass
+        _DB.update({"ok": True, "path": db_path, "conn": c})
+        return c
+    except Exception:
+        _DB.update({"ok": False, "path": db_path, "conn": None})
+        return None
+
+
+def _db_for(outpath):
+    """按索引输出路径定位同目录的 memory.db（每角色一份）。"""
+    dbp = os.path.join(os.path.dirname(outpath or ""), "memory.db") if outpath else ""
+    if not dbp:
+        return None
+    if _DB["ok"] and _DB["path"] == dbp and _DB["conn"] is not None:
+        return _DB["conn"]
+    return _db_open(dbp)
+
+
+def _row_entry(c, r):
+    """SQL 行 -> 条目 dict（tags 还原成列表，兼容旧算法）。"""
+    d = dict(r)
+    d["text"] = d.pop("body", "")
+    for k in ("people", "topics", "things"):
+        v = d.get(k) or ""
+        d[k] = [x for x in v.split("|") if x]
+    d["retired"] = bool(d.get("retired"))
+    return d
+
+
+def _entry_row(e, hay=None):
+    tags = " ".join((e.get("people") or []) + (e.get("topics") or []) + (e.get("things") or []))
+    if hay is None:
+        hay = " ".join([str(e.get("head") or ""), str(e.get("summary") or ""),
+                        str(e.get("text") or ""), tags]).lower()
+    return (
+        e.get("id") or "", e.get("anchor") or "", e.get("source") or "",
+        e.get("time") or "", e.get("date") or "", e.get("period") or "",
+        e.get("hour"), (e.get("head") or "")[:60], e.get("summary") or "",
+        e.get("text") or "", hay,
+        "|".join(e.get("people") or []), "|".join(e.get("topics") or []),
+        "|".join(e.get("things") or []),
+        int(e.get("access_count") or 0), e.get("last_access") or "",
+        1 if e.get("retired") else 0, e.get("retired_at") or "",
+    )
+
+
+def _db_upsert(c, e):
+    try:
+        c.execute(
+            "INSERT OR REPLACE INTO entries(id,anchor,source,time,date,period,hour,head,summary,body,hay,"
+            "people,topics,things,access_count,last_access,retired,retired_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            _entry_row(e))
+        return True
+    except Exception:
+        return False
+
+
+def _db_import_json(c, json_path):
+    """首次迁移：把旧的 index.json 导入库（只导一次）。"""
+    try:
+        if not json_path or not os.path.isfile(json_path):
+            return 0
+        if c.execute("SELECT COUNT(*) FROM entries").fetchone()[0] > 0:
+            return 0
+        data = json.load(io.open(json_path, encoding="utf-8")) or []
+    except Exception:
+        return 0
+    n = 0
+    for e in data:
+        if _db_upsert(c, e):
+            n += 1
+    c.commit()
+    if n:
+        _db_rebuild_links(c)   # 迁移后补建互链，否则 links 会是空的
+        c.commit()
+    return n
+
+
+def _cat(n, people, topics, things):
+    if n in people:
+        return "人"
+    if n in topics:
+        return "事"
+    if n in things:
+        return "物"
+    return "实体"
+
+
+def _edge_type(a, b, people, topics, things, ents):
+    """互链类型：同人/同事/同物、人-事/人-物/事-物、实体、共现（可多类型，首项为主）。"""
+    ca, cb = _cat(a, people, topics, things), _cat(b, people, topics, things)
+    ts = []
+    if ca == cb == "人":
+        ts.append("同人")
+    elif ca == cb == "事":
+        ts.append("同事")
+    elif ca == cb == "物":
+        ts.append("同物")
+    elif {ca, cb} == {"人", "事"}:
+        ts.append("人-事")
+    elif {ca, cb} == {"人", "物"}:
+        ts.append("人-物")
+    elif {ca, cb} == {"事", "物"}:
+        ts.append("事-物")
+    if "实体" in (ca, cb) and "实体" not in ts:
+        ts.append("实体")
+    if not ts:
+        ts.append("共现")
+    return "|".join(ts)
+
+
+def _db_rebuild_links(c):
+    """重建互链（标签 + 正文实体，共现边）。建库时跑一次，成本可控。"""
+    try:
+        c.execute("DELETE FROM nodes")
+        c.execute("DELETE FROM edges")
+        nodes, edges = {}, {}
+        for r in c.execute("SELECT id,head,summary,body,people,topics,things FROM entries"):
+            d = _row_entry(c, r)
+            ns = []
+            for k in ("people", "topics", "things"):
+                ns.extend(d.get(k) or [])
+            ent_text = "%s %s %s" % (d.get("head") or "", d.get("summary") or "", (d.get("text") or "")[:400])
+            for x in extract_entities(ent_text)[:6]:
+                ns.append(x)
+            ns = list(dict.fromkeys([n for n in ns if n]))
+            for n in ns:
+                nodes[n] = nodes.get(n, 0) + 1
+            people = d.get("people") or []
+            topics = d.get("topics") or []
+            things = d.get("things") or []
+            ents = extract_entities(ent_text)
+            for i in range(len(ns)):
+                for j in range(i + 1, len(ns)):
+                    a, b = sorted((ns[i], ns[j]))
+                    cur = edges.get((a, b))
+                    if cur is None:
+                        edges[(a, b)] = {"w": 1, "type": _edge_type(a, b, people, topics, things, ents)}
+                    else:
+                        cur["w"] += 1
+                        if "实体" in cur["type"] and a not in ents and b not in ents:
+                            pass
+        c.executemany("INSERT OR REPLACE INTO nodes(name,n) VALUES(?,?)", list(nodes.items()))
+        c.executemany("INSERT OR REPLACE INTO edges(a,b,w,type) VALUES(?,?,?,?)",
+                      [(a, b, v["w"], v.get("type") or "共现") for (a, b), v in edges.items()])
+        c.commit()
+    except Exception:
+        pass
+
+
+def _db_ready(req):
+    """取连接；库为空而旧 index.json 在就先迁移（兼容只给 index 的旧调用）。"""
+    idx = req.get("index") or ""
+    c = _db_for(idx)
+    if c is None:
+        return None
+    try:
+        if c.execute("SELECT COUNT(*) FROM entries").fetchone()[0] == 0:
+            _db_import_json(c, idx)
+    except Exception:
+        pass
+    return c
+
+
+def db_build(memdir, outpath=None, extra_dirs=None, exclude=None):
+    """增量建库：只重扫 mtime 变过的文件；返回条目总数。"""
+    c = _db_for(outpath)
+    if c is None:
+        return None
+    _db_import_json(c, outpath)
+    skip_dirs = {"settled", "backup", "备份", "archive", "MemoryFacts"}
+    ex = set(str(x).replace("\\", "/") for x in (exclude or []))
+    jobs = [(memdir, "")]
+    for d in (extra_dirs or []):
+        if d and os.path.isdir(d):
+            jobs.append((d, "facts/"))
+    seen = set()
+    changed = False
+    for base, prefix in jobs:
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith(".")]
+            for fn in files:
+                if not fn.lower().endswith((".md", ".txt")) or ".bak" in fn.lower():
+                    continue
+                fpath = os.path.join(root, fn)
+                rel = prefix + os.path.relpath(fpath, base).replace("\\", "/")
+                if prefix == "" and _is_excluded(rel, ex):
+                    continue
+                seen.add(rel)
+                try:
+                    mt = os.path.getmtime(fpath)
+                except Exception:
+                    continue
+                row = c.execute("SELECT mtime FROM files WHERE path=?", (rel,)).fetchone()
+                if row and abs(float(row["mtime"]) - mt) < 1e-6:
+                    continue
+                try:
+                    text = io.open(fpath, encoding="utf-8", errors="ignore").read()
+                except Exception:
+                    continue
+                t = _guess_time(fn, fpath)
+                c.execute("DELETE FROM entries WHERE source=?", (rel,))
+                for i, (head, body) in enumerate(_split_blocks(text)):
+                    if len(body.strip()) < 12:
+                        continue
+                    hh = _extract_hour(body)
+                    ent = {
+                        "id": "%s#%d" % (os.path.splitext(rel)[0], i),
+                        "anchor": hashlib.sha1(body.strip()[:80].encode("utf-8")).hexdigest()[:12],
+                        "source": rel, "time": t["time"], "date": t["date"], "period": t["period"],
+                        "hour": hh if hh is not None else t["hour"],
+                        "head": head[:60], "summary": _first_sent(body), "text": body.strip(),
+                    }
+                    tags = _tag(body)
+                    ent["people"] = tags.get("people") or []
+                    ent["topics"] = tags.get("topics") or []
+                    ent["things"] = tags.get("things") or []
+                    _db_upsert(c, ent)
+                c.execute("INSERT OR REPLACE INTO files(path,mtime) VALUES(?,?)", (rel, mt))
+                changed = True
+    # 文件已消失：清掉它的条目
+    for r in c.execute("SELECT path FROM files").fetchall():
+        p = r["path"]
+        if p not in seen:
+            c.execute("DELETE FROM entries WHERE source=?", (p,))
+            c.execute("DELETE FROM files WHERE path=?", (p,))
+            changed = True
+    if changed:
+        _db_rebuild_links(c)
+        try:
+            c.execute("DELETE FROM vec")
+        except Exception:
+            pass
+        c.commit()
+    n = c.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+    return n
+
+
+def _db_where_time(req, alias=""):
+    where, args = [], []
+    df = req.get("date_from") or None
+    dt = req.get("date_to") or None
+    pd = req.get("period") or None
+    hf, ht = req.get("hour_from"), req.get("hour_to")
+    if df:
+        where.append("date >= ?"); args.append(df)
+    if dt:
+        where.append("date <= ?"); args.append(dt)
+    if pd:
+        where.append("period LIKE ?"); args.append("%" + pd + "%")
+    if hf is not None:
+        where.append("hour IS NOT NULL AND hour >= ?"); args.append(int(hf))
+    if ht is not None:
+        where.append("hour IS NOT NULL AND hour <= ?"); args.append(int(ht))
+    where.append("retired = 0")
+    return where, args
+
+
+def _db_score(entry, terms):
+    """与 JSON 版 score_entry 同规则（标签3 > 标题3 > 摘要2 > 正文1，按词频权重）。"""
+    tags = " ".join((entry.get("people") or []) + (entry.get("topics") or []) + (entry.get("things") or [])).lower()
+    head = (entry.get("head") or "").lower()
+    summary = (entry.get("summary") or "").lower()
+    text = (entry.get("text") or "").lower()
+    total = 0.0
+    hit = 0
+    for t in terms:
+        if t in tags:
+            s = W_TAG
+        elif t in head:
+            s = W_HEAD
+        elif t in summary:
+            s = W_SUMMARY
+        elif t in text:
+            s = W_TEXT
+        else:
+            s = 0
+        if s:
+            total += s
+            hit += 1
+    return total, hit
+
+
+def _db_boost(entry):
+    """强化 + 衰减（与 _entry_weight 同规则，但作用在数据库行上）。"""
+    ac = min(int(entry.get("access_count") or 0), 5)
+    reinforce = 1.0 + 0.05 * ac
+    base = entry.get("last_access") or entry.get("date") or ""
+    decay = 1.0
+    try:
+        if base:
+            age = (datetime.date.today() - datetime.date.fromisoformat(str(base)[:10])).days
+            decay = 0.5 ** (max(0, age) / float(_CFG.get("half_life", 30)))
+    except Exception:
+        decay = 1.0
+    return max(0.6, min(1.25, reinforce * max(0.05, decay) + 0.25 * min(1.0, decay)))
+
+
+def _db_vec_get(c, eid):
+    k = "v:" + str(eid)
+    v = _VEC_CACHE.get(k)
+    if v is not None:
+        return v
+    try:
+        row = c.execute("SELECT data FROM vec WHERE id=?", (eid,)).fetchone()
+        if row and row["data"]:
+            arr = struct.unpack("<%df" % (len(row["data"]) // 4), row["data"])
+            v = list(arr)
+            _VEC_CACHE[k] = v
+            return v
+    except Exception:
+        pass
+    return None
+
+
+def _db_vec_put(c, eid, vec):
+    try:
+        if vec:
+            _VEC_CACHE["v:" + str(eid)] = vec
+            c.execute("INSERT OR REPLACE INTO vec(id,data) VALUES(?,?)",
+                      (eid, struct.pack("<%df" % len(vec), *vec)))
+    except Exception:
+        pass
+
+
+def db_recall(req):
+    """数据库版召回：SQL 预筛（时间/标签/关键词）→ 词频打分 → 语义 RRF → 强化衰减。"""
+    outpath = req.get("index")
+    c = _db_ready(req)
+    if c is None:
+        return None
+    if req.get("half_life"):
+        try:
+            _CFG["half_life"] = float(req.get("half_life"))
+        except Exception:
+            pass
+    q = (req.get("query") or "").strip()
+    k = max(1, int(req.get("top_k") or 5))
+    terms = tokenize(q)
+    if not terms:
+        return {"bookmarks": "", "count": 0}
+    df, dt, pd = req.get("date_from") or None, req.get("date_to") or None, req.get("period") or None
+    if not df and not dt and not pd:
+        df, dt, pd = parse_time_hint(q)
+    r2 = dict(req)
+    r2.update({"date_from": df, "date_to": dt, "period": pd})
+    where, args = _db_where_time(r2)
+    # ★只给"自动书签"用：按条目日期跳过最近 N 天（不是文件 mtime）；手动工具传 0 不跳过
+    try:
+        _skip = int(req.get("skip_recent_days") or 0)
+    except Exception:
+        _skip = 0
+    if _skip > 0:
+        _cut = (datetime.date.today() - datetime.timedelta(days=_skip)).isoformat()
+        where.append("(date IS NULL OR date = '' OR date < ?)")
+        args.append(_cut)
+    keys = sorted({t for t in terms if len(t) >= 2}, key=len, reverse=True)[:3] or list(terms)[:3]
+    like = " OR ".join(["hay LIKE ?"] * len(keys))
+    sql = "SELECT * FROM entries WHERE " + " AND ".join(where) + " AND (" + like + ") ORDER BY time DESC LIMIT 400"
+    rows = [_row_entry(c, r) for r in c.execute(sql, args + ["%" + t.lower() + "%" for t in keys])]
+    if not rows:
+        return {"bookmarks": "", "count": 0}
+    scored = []
+    for e in rows:
+        w, hit = _db_score(e, terms)
+        if w > 0:
+            scored.append((w, hit, e.get("time") or "", e))
+    if not scored:
+        return {"bookmarks": "", "count": 0}
+    scored.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+    kw_rank = {id(x[3]): i + 1 for i, x in enumerate(scored)}
+
+    fused = None
+    qv = _embed([q]) if _MODEL["ready"] else None
+    if qv:
+        cand = scored[:80]
+        sims = []
+        for _, _, _, e in cand:
+            v = _db_vec_get(c, e.get("id"))
+            if v is None:
+                vs = _embed([(e.get("summary") or "") + " " + (e.get("text") or "")[:300]]) or []
+                v = vs[0] if vs else None
+                _db_vec_put(c, e.get("id"), v)
+            if v:
+                sims.append((_cos(qv[0], v), e))
+        if sims:
+            sims.sort(key=lambda x: x[0], reverse=True)
+            sem_rank = {id(e): i + 1 for i, (_, e) in enumerate(sims)}
+            K = 60
+            fuse = []
+            for _, _, _, e in scored:
+                rrf = 0.0
+                if id(e) in kw_rank:
+                    rrf += 1.0 / (K + kw_rank[id(e)])
+                if id(e) in sem_rank:
+                    rrf += 1.0 / (K + sem_rank[id(e)])
+                dual = (id(e) in kw_rank) and (id(e) in sem_rank)
+                fuse.append((rrf * _db_boost(e), 1 if dual else 0, e.get("time") or "", e))
+            fuse.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+            fused = fuse
+    final = fused if fused else [(w / 1000.0 * _db_boost(e), hit, t, e) for w, hit, t, e in scored]
+    top = final[0][0] if final else 0
+    cutoff = top * 0.45
+    out = []
+    today = datetime.date.today().isoformat()
+    for score, _, _, e in final:
+        if score < cutoff:
+            break
+        try:
+            c.execute("UPDATE entries SET access_count=access_count+1, last_access=? WHERE id=?", (today, e.get("id")))
+        except Exception:
+            pass
+        out.append(e)
+        if len(out) >= k:
+            break
+    try:
+        c.commit()
+    except Exception:
+        pass
+    return {"bookmarks": to_bookmarks(out), "count": len(out)}
+
+
+def db_browse(req):
+    c = _db_ready(req)
+    if c is None:
+        return None
+    where, args = _db_where_time(req)
+    q = (req.get("query") or "").strip().lower()
+    if q:
+        where.append("hay LIKE ?"); args.append("%" + q + "%")
+    for key, col in (("who", "people"), ("topic", "topics"), ("thing", "things")):
+        v = (req.get(key) or "").strip()
+        if v:
+            where.append(col + " LIKE ?"); args.append("%" + v + "%")
+    wsql = " AND ".join(where)
+    total = c.execute("SELECT COUNT(*) FROM entries WHERE " + wsql, args).fetchone()[0]
+    off = max(0, int(req.get("offset") or 0))
+    lim = max(1, min(200, int(req.get("limit") or 50)))
+    rows = c.execute("SELECT * FROM entries WHERE " + wsql + " ORDER BY time DESC LIMIT ? OFFSET ?",
+                     args + [lim, off]).fetchall()
+    items, lines = [], []
+    for r in rows:
+        d = _row_entry(c, r)
+        d["rel_time"] = rel_time(d.get("date", ""))
+        items.append({k2: d.get(k2) for k2 in ("id", "date", "period", "head", "summary", "source", "people", "topics", "things", "rel_time")})
+        label = "、".join((d.get("topics") or []) + (d.get("things") or [])) or (d.get("head") or "记忆")
+        lines.append("- [%s] %s：%s（出处 %s）" % (d.get("date"), label, d.get("summary"), d.get("source")))
+    return {"total": total, "offset": off, "items": items, "text": "\n".join(lines)}
+
+
+def db_stats(req):
+    c = _db_ready(req)
+    if c is None:
+        return None
+    n = c.execute("SELECT COUNT(*) FROM entries WHERE retired=0").fetchone()[0]
+    row = c.execute("SELECT MIN(date), MAX(date) FROM entries WHERE retired=0").fetchone()
+    first, last = (row[0] or ""), (row[1] or "")
+    return {"count": n, "first": first, "last": last,
+            "text": "索引共 %d 条，覆盖 %s ~ %s" % (n, first or "?", last or "?")}
+
+
+def db_links(req):
+    c = _db_ready(req)
+    if c is None:
+        return None
+    q = (req.get("query") or "").strip().lower()
+    top = max(1, int(req.get("top") or 6))
+    want = (req.get("type") or "").strip()
+    seeds = []
+    if q:
+        for r in c.execute("SELECT name,n FROM nodes ORDER BY n DESC LIMIT 500"):
+            nl = (r["name"] or "").lower()
+            if nl and (nl in q or (len(nl) >= 2 and q in nl)):
+                seeds.append((r["name"], r["n"]))
+    seeds = seeds[:3]
+    items, lines = [], []
+    for name, cnt in seeds:
+        nb = []
+        # ★过滤必须同时作用在 UNION 两段上（否则前半段会把所有边都带出来）
+        cond = " AND type LIKE ?" if want else ""
+        sql = ("SELECT b AS x,w,type FROM edges WHERE a=?" + cond + " UNION "
+               "SELECT a AS x,w,type FROM edges WHERE b=?" + cond + " ORDER BY w DESC LIMIT ?")
+        args = [name]
+        if want:
+            args.append("%" + want + "%")
+        args.append(name)
+        if want:
+            args.append("%" + want + "%")
+        args.append(top)
+        for r in c.execute(sql, args):
+            nb.append({"name": r["x"], "w": r["w"], "type": (r["type"] or "共现").split("|")[0]})
+        items.append({"node": name, "count": cnt, "neighbors": nb})
+        lines.append("- %s：出现 %d 次；常一起出现 → %s" % (
+            name, cnt, "、".join("%s(%d·%s)" % (x["name"], x["w"], x.get("type") or "共现") for x in nb) or "（没有邻居）"))
+    return {"seeds": [n for n, _ in seeds], "items": items, "text": "\n".join(lines)}
+
+
+def db_load_all(outpath):
+    """把库内容整份取出（兼容仍按 _load_index() 工作的旧算法，如 compactscan/audit）。"""
+    c = _db_for(outpath)
+    if c is None:
+        return None
+    try:
+        return [_row_entry(c, r) for r in c.execute("SELECT * FROM entries")]
+    except Exception:
+        return None
+
+
+def db_reset_op(req):
+    """清空索引库：关连接 → 删 memory.db（官方文件与事实卡都不动）。"""
+    idx = req.get("index") or ""
+    dbp = os.path.join(os.path.dirname(idx), "memory.db") if idx else ""
+    try:
+        cn = _DB.get("conn")
+        if cn is not None:
+            try:
+                cn.close()
+            except Exception:
+                pass
+        _DB.update({"ok": False, "path": "", "conn": None})
+        if dbp and os.path.isfile(dbp):
+            os.remove(dbp)
+        return {"count": 0, "text": "索引库已清空（下次 build 会重建）"}
+    except Exception as e:
+        return {"count": 0, "text": "清空失败：%s" % e}
+
+
+def db_build_op(req):
+    """build 的数据库入口：成功后清掉内存缓存，让后续读取走库。"""
+    out = req.get("out") or ""
+    n = db_build(req.get("memdir") or "", out, req.get("extra") or [], req.get("exclude") or [])
+    if n is None:
+        return None
+    _set_index(out)
+    _IDX["data"] = None
+    return {"count": n, "out": out, "text": "建库完成：%d 条" % n}
+
+
+_DB_OPS = {
+    "build": db_build_op,
+    "recall": db_recall,
+    "browse": db_browse,
+    "stats": db_stats,
+    "links": db_links,
+    "reset": db_reset_op,
+}
+
 def main():
 
     def reply(obj):
@@ -1088,6 +2183,14 @@ def main():
         if fn == "__shutdown__":
             break
         try:
+            # ★数据库优先：build/recall/browse/stats/links 直接走 SQLite
+            _set_index(req.get("index"))
+            _dbop = _DB_OPS.get(fn)
+            if _dbop is not None:
+                payload = _dbop(req)
+                if payload is not None:
+                    reply({"id": rid, "ok": True, **payload})
+                    continue
             if fn == "ping":
                 reply({"id": rid, "ok": True, "device": _MODEL["device"], "dim": 512})
             elif fn == "warm":
@@ -1118,14 +2221,15 @@ def main():
                               date_to=req.get("date_to") or None,
                               period=req.get("period") or None,
                               hour_from=req.get("hour_from"), hour_to=req.get("hour_to"),
-                              use_graph=bool(req.get("use_graph", True)))
+                              use_graph=bool(req.get("use_graph", True)),
+                              skip_recent_days=int(req.get("skip_recent_days") or 0))
                 reply({"id": rid, "ok": True, "bookmarks": to_bookmarks(hits), "count": len(hits)})
             elif fn == "build":
                 if req.get("block_max"):
                     _CFG["block_max"] = int(req.get("block_max"))
                 memdir = req.get("memdir") or ""
                 outpath = req.get("out") or ""
-                n, outp = build_index(memdir, outpath)
+                n, outp = build_index(memdir, outpath, req.get("extra") or [], req.get("exclude") or [])
                 _set_index(outp)
                 reply({"id": rid, "ok": True, "count": n, "out": outp})
             elif fn == "fetch":
@@ -1157,6 +2261,53 @@ def main():
             elif fn == "loops":
                 txt = open_loops(req.get("keyword"), int(req.get("limit") or 20))
                 reply({"id": rid, "ok": True, "text": txt})
+            elif fn == "bytime":
+                _set_index(req.get("index"))
+                hits = bytime(date_from=req.get("date_from") or None,
+                              date_to=req.get("date_to") or None,
+                              period=req.get("period") or None,
+                              hour_from=req.get("hour_from"),
+                              hour_to=req.get("hour_to"),
+                              top_k=int(req.get("top_k") or 10))
+                reply({"id": rid, "ok": True, "bookmarks": to_bookmarks(hits), "count": len(hits)})
+            elif fn == "stats":
+                _set_index(req.get("index"))
+                st = index_stats()
+                txt = "索引共 %d 条，覆盖 %s ~ %s" % (st["count"], st["first"] or "?", st["last"] or "?")
+                reply({"id": rid, "ok": True, **st, "text": txt})
+            elif fn == "links":
+                _set_index(req.get("index"))
+                r = links(req.get("query") or "", int(req.get("top") or 6))
+                reply({"id": rid, "ok": True, **r})
+            elif fn == "bywhen":
+                _set_index(req.get("index"))
+                r = bywhen(req.get("text") or "", req.get("keyword") or None,
+                           int(req.get("top_k") or 8), bool(req.get("use_graph", True)))
+                reply({"id": rid, "ok": True, **r})
+            elif fn == "compactscan":
+                _set_index(req.get("index"))
+                cands = compact_scan(req.get("memdir") or "",
+                                     int(req.get("min_entries") or 30),
+                                     int(req.get("min_age_days") or 7),
+                                     int(req.get("max_chars") or 20000),
+                                     int(req.get("top_k") or 8),
+                                     req.get("exclude") or [])
+                reply({"id": rid, "ok": True, "candidates": cands, "count": len(cands)})
+            elif fn == "auditscan":
+                _set_index(req.get("index"))
+                rows = audit_scan(req.get("factsdir") or req.get("memdir") or "", int(req.get("limit") or 30),
+                                  float(req.get("dup") or 0.85), float(req.get("near") or 0.5),
+                                  int(req.get("max_facts") or 400))
+                reply({"id": rid, "ok": True, "issues": rows, "count": len(rows)})
+            elif fn == "factmerge":
+                r = fact_merge(req.get("lines") or [], req.get("existing") or "", float(req.get("threshold") or 0.5))
+                reply({"id": rid, "ok": True, **r})
+            elif fn == "browse":
+                _set_index(req.get("index"))
+                r = browse(req.get("query"), req.get("who"), req.get("topic"), req.get("thing"),
+                           req.get("date_from") or None, req.get("date_to") or None,
+                           int(req.get("offset") or 0), int(req.get("limit") or 50))
+                reply({"id": rid, "ok": True, **r})
             else:
                 reply({"id": rid, "ok": False, "error": "unknown fn: %s" % fn})
         except Exception as e:
