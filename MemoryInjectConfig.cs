@@ -166,7 +166,7 @@ public class MemoryInjectConfig
     [DisplayName("提示文本")]
     [Description("命中后追加到消息末尾的提示。{n} 命中条数、{files} 命中文件、{path} 记忆目录。")]
     public string HintTemplate { get; set; } =
-        "[回忆提示：Memory 里可能有 {n} 条旧账跟这句相关（{files}）。要查往事就先调工具，别扫盘：" +
+        "[回忆提示：Memory 里可能有 {n} 条旧账跟这句相关（{files}）。要查往事就调记忆工具（别用 python/别扫盘）：" +
         "<memrecall query=\"关键词\"/> 查书签、<memfetch source=\"出处文件名\"/> 取原文、" +
-        "<memwhen time=\"上周三\"/> 按时间翻；工具都查不到，再考虑看目录 {path}。]";
+        "<memwhen time=\"上周三\"/> 按时间翻；工具都查不到就直说没查到，不要编。]";
 }
