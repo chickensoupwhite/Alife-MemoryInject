@@ -26,6 +26,10 @@ public class MemoryInjectConfig
     [Description("记忆文件所在位置，相对角色目录。默认 Storage/Memory。")]
     public string MemorySubPath { get; set; } = "Storage/Memory";
 
+    [DisplayName("附加记忆目录（每行一个）")]
+    [Description("相对角色目录的附加来源；留空时自动尝试 Memory 与 Storage/Memory。来源只读，最终统一进入本角色索引。")]
+    public string MemorySourcePaths { get; set; } = "";
+
     [DisplayName("最多提示几条")]
     [Description("提示里最多列出几个命中的记忆文件。建议 3。")]
     public int MaxResults { get; set; } = 3;
@@ -94,9 +98,12 @@ public class MemoryInjectConfig
     [Description("后台每隔这么久检查一次记忆目录：有了新记忆文件就自动并进索引，不用手动点重建。建议 10。")]
     public int AutoOrganizeMinutes { get; set; } = 10;
 
-    [DisplayName("手动排除的来源（每行一个）")]
-    [Description("相对路径或目录前缀，例如 L1/ 排掉整个 L1；L1/xxx.txt 排掉单个文件。官方文件不会被删除，只是不进我们的索引。")]
-    public string ExcludeSources { get; set; } = "";
+    [DisplayName("排除的记忆来源（每行一个）")]
+    [Description("相对路径或目录前缀，例如 L1/ 排掉整个 L1；L1/xxx.txt 排掉单个文件。默认排除 L1/ 以避免首次索引过大。官方文件不会被删除，只是不进我们的索引。")]
+    public string ExcludeSources { get; set; } = "L1/";
+
+    /// <summary>默认规则迁移版本；升级时仅在用户仍使用旧默认空值时自动应用推荐排除规则。</summary>
+    public int DefaultsMigrationVersion { get; set; } = 0;
 
     [DisplayName("首次迁移旧索引")]
     [Description("开：首次启动把官方目录里的旧 index.json 复制过来导入；关：直接按现有记忆文件重建新库。默认开。")]
