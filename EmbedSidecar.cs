@@ -224,11 +224,11 @@ public sealed class EmbedSidecar : IAsyncDisposable
     /// 侧车常驻后单次约十几毫秒；超时或未就绪立刻返回 null，绝不死等、绝不外抛。
     /// 走 Task.Run 隔离，不会把同步钩子所在的 UI 线程拖死。
     /// </summary>
-    public string? RecallSync(string query, int waitMs, string? indexPath = null, double? halfLife = null, bool? useGraph = null, int skipRecentDays = 0)
+    public string? RecallSync(string query, int waitMs, string? indexPath = null, double? halfLife = null, bool? useGraph = null, int skipRecentDays = 0, int topK = 5)
     {
         if (IsReady == false || Busy || process == null || process.HasExited) return null;
         int budget = Math.Max(waitMs, 20);
-        Task<string?> t = Task.Run(() => RecallAsync(query, budget * 4, indexPath, halfLife, useGraph, skipRecentDays));
+        Task<string?> t = Task.Run(() => RecallAsync(query, budget * 4, indexPath, halfLife, useGraph, skipRecentDays, topK));
         try
         {
             if (t.Wait(budget) == false) return null;
@@ -241,7 +241,7 @@ public sealed class EmbedSidecar : IAsyncDisposable
     }
 
     /// <summary>异步召回：发 recall 请求给侧车、拿书签文本；失败返回 null。</summary>
-    public async Task<string?> RecallAsync(string query, int timeoutMs = 800, string? indexPath = null, double? halfLife = null, bool? useGraph = null, int skipRecentDays = 0)
+    public async Task<string?> RecallAsync(string query, int timeoutMs = 800, string? indexPath = null, double? halfLife = null, bool? useGraph = null, int skipRecentDays = 0, int topK = 5)
     {
         if (IsReady == false || process == null || process.HasExited) return null;
         int id = Interlocked.Increment(ref nextId);
@@ -250,7 +250,7 @@ public sealed class EmbedSidecar : IAsyncDisposable
 
         try
         {
-            string payload = JsonSerializer.Serialize(new { id, fn = "recall", query, top_k = 5, index = indexPath ?? "", half_life = halfLife, use_graph = useGraph, skip_recent_days = skipRecentDays });
+            string payload = JsonSerializer.Serialize(new { id, fn = "recall", query, top_k = Math.Clamp(topK, 1, 20), index = indexPath ?? "", half_life = halfLife, use_graph = useGraph, skip_recent_days = skipRecentDays });
             await writeLock.WaitAsync().ConfigureAwait(false);
             try
             {
