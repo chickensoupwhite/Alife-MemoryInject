@@ -1,5 +1,5 @@
-{
- "Version": "4.8.2",
+﻿{
+ "Version": "4.8.3",
  "Dependencies": {
   "Alife.Function.FunctionCaller": ""
  }
