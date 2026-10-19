@@ -41,7 +41,8 @@ public class MemoryInjectModule(
 {
     public MemoryInjectConfig Configuration { get; set; } = null!;
 
-    string memoryRoot = "";          // 官方记忆目录（只读）
+    string memoryRoot = "";          // 主记忆目录（只读，兼容旧代码）
+    readonly List<(string root, string prefix)> memoryRoots = new();
     string roleRoot = "";            // 角色根目录
     string factsRoot = "";           // 我们自己的事实层（写这里，绝不写官方目录）
     string compactStatePath = "";    // 已压缩来源清单（只影响我们的索引，不动官方文件）
@@ -51,6 +52,7 @@ public class MemoryInjectModule(
     string scriptPath = "";
     string indexPath = "";
     DateTime lastBuildCheck = DateTime.MinValue;
+    readonly SemaphoreSlim rebuildLock = new(1, 1);
     volatile bool warmDone = false;   // 索引/模型预热是否完成（未完成时首次查询给长窗口）
     DateTime lastScanStamp = DateTime.MinValue;
     volatile bool hasMemory;   // 本角色有没有记忆文件：没有就别启侧车/别检索，免得串到别人的索引
@@ -83,12 +85,23 @@ public class MemoryInjectModule(
 
     DateTime lastMaintain = DateTime.MinValue;
     DateTime lastLlmOrganize = DateTime.MinValue;   // 上次模型整理时间（提炼事实卡）
+    DateTime lastCompactOk = DateTime.MinValue;     // 上次压缩"健康"完成（扫到清单且没积压/有产出）
     DateTime lastCompact = DateTime.MinValue;        // 上次自动压缩（流水 -> 事实卡）
     DateTime lastAudit = DateTime.MinValue;          // 上次事实审计
     volatile bool compacting;                        // 压缩/审计互斥，避免并发重复干活
     volatile bool auditing;
     readonly SemaphoreSlim factLock = new(1, 1);      // 事实卡写入串行化（整理与压缩会并发）
     string llmStatePath = "";                        // 记录"已整理到哪个文件/时间"的水位
+
+    // 升级只迁移仍处于旧默认值的配置，保留用户自定义的排除规则。
+    void ApplyDefaultMigrations()
+    {
+        if (Configuration == null || Configuration.DefaultsMigrationVersion >= 1) return;
+        if (string.IsNullOrWhiteSpace(Configuration.ExcludeSources))
+            Configuration.ExcludeSources = "L1/";
+        Configuration.DefaultsMigrationVersion = 1;
+        logger.LogInformation("记忆书签：已应用默认规则迁移 v1（仅在原排除规则为空时加入 L1/；用户自定义规则保留）");
+    }
 
     // 判断目录里有没有记忆文件（.md/.txt，递归；跳过 settled/backup/.bak）
     static bool HasMemoryFiles(string dir)
@@ -112,15 +125,36 @@ public class MemoryInjectModule(
     // 解析记忆目录：配置路径存在就用它；否则按候选顺序自动探测，兼容不同角色的目录结构
     string ResolveMemoryRoot(string roleRoot, string configuredRoot)
     {
-        if (Directory.Exists(configuredRoot) && HasMemoryFiles(configuredRoot)) return configuredRoot;
-        string[] cands = { "Memory", "Storage/Memory", "Storage", "" };
-        foreach (string c in cands)
+        memoryRoots.Clear();
+        var candidates = new List<string> { configuredRoot };
+        string raw = Configuration?.MemorySourcePaths ?? "";
+        foreach (string part in raw.Split(new[] { '\n', '\r', ',', ';' }, StringSplitOptions.RemoveEmptyEntries))
         {
-            string norm = c.Replace('/', Path.DirectorySeparatorChar);
-            string cand = string.IsNullOrEmpty(norm) ? roleRoot : Path.Combine(roleRoot, norm);
-            if (HasMemoryFiles(cand)) return cand;
+            string rel = part.Trim().Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar);
+            if (rel.Length == 0 || Path.IsPathRooted(rel))
+            {
+                if (rel.Length > 0) logger.LogWarning("记忆书签：忽略角色目录外的记忆来源配置：{Path}", part.Trim());
+                continue;
+            }
+            string candidate = Path.GetFullPath(Path.Combine(roleRoot, rel));
+            if (candidate.StartsWith(Path.GetFullPath(roleRoot).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                candidates.Add(candidate);
+            else
+                logger.LogWarning("记忆书签：忽略越过角色根目录的来源配置：{Path}", part.Trim());
         }
-        return configuredRoot;
+        candidates.Add(Path.Combine(roleRoot, "Memory"));
+        candidates.Add(Path.Combine(roleRoot, "Storage/Memory"));
+        int sourceNo = 0;
+        foreach (string path in candidates.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (Directory.Exists(path) && HasMemoryFiles(path))
+            {
+                string prefix = sourceNo++ == 0 ? "" : "source" + sourceNo + "/";
+                memoryRoots.Add((path, prefix));
+            }
+        }
+        if (memoryRoots.Count == 0) memoryRoots.Add((configuredRoot, ""));
+        return memoryRoots[0].root;
     }
 
     protected override Task OnAwake()
@@ -128,6 +162,7 @@ public class MemoryInjectModule(
         try
         {
             roleRoot = Path.Combine(AlifePath.StorageFolderPath, Character.StorageKey);
+            ApplyDefaultMigrations();
             string sub = (Configuration?.MemorySubPath ?? "Storage/Memory")
                 .Replace('/', Path.DirectorySeparatorChar)
                 .Replace('\\', Path.DirectorySeparatorChar);
@@ -169,8 +204,11 @@ public class MemoryInjectModule(
             logger.LogError(e, "记忆回忆提示：路径初始化失败");
         }
 
+        // 清掉历史换库留下的 swap / 旧备份（每份几十~几百 MB，不清会把盘吃满）
+        try { PruneBackups(); } catch { }
+
         // 本角色有没有记忆文件：没有就别启侧车、别检索（否则会串到别人的索引）
-        try { hasMemory = HasMemoryFiles(memoryRoot); } catch { hasMemory = false; }
+        try { hasMemory = memoryRoots.Any(x => HasMemoryFiles(x.root)); } catch { hasMemory = false; }
 
         try { ChatBot.ChatSend += OnChatSend; }
         catch (Exception e) { logger.LogError(e, "记忆回忆提示：挂载 ChatSend 失败"); }
@@ -180,13 +218,14 @@ public class MemoryInjectModule(
         {
             XmlHandler handler = new(this)
             {
-                Description = "记忆检索工具：翻自己落盘的旧账。想确认往事、查来龙去脉、按时间找、盘点欠账时，先调这里的工具，" +
-                              "不要用文件系统去扫记忆目录。九把镰刀：memrecall 按人事查书签；memwhen 按时间（上周三/三天前/昨晚）翻；" +
-                              "memfetch 取原文；memprofile 按人聚画像；memloops 钓牵挂欠账；memstatus 看索引体量；" +
-                              "memcompact 压流水；memaudit 查重复矛盾；memlinks 顺关系看邻居。",
+                Description = "记忆检索工具：翻自己落盘的旧账。想确认往事、查来龙去脉、按时间找、盘点欠账时，**只能**用这里的工具，" +
+                              "禁止用 <Python>、读文件、扫目录、sqlite3 去查记忆（既慢又容易读到过期数据）。" +
+                              "memrecall 按人事查书签；memwhen 按时间翻；memfetch 取原文；memprofile 聚画像；memloops 钓欠账；" +
+                              "memstatus 看索引；memlinks 顺关系；memdebug 解释召回；memcompact 压流水；memaudit 审矛盾。",
                 Explanation =
-                    "八个函数：六个检索是只读的；压缩/审计只写事实卡与报告，不动原文。" +
-                    "★铁律：查记忆只用下面这些工具，禁止用 glob/读文件的方式翻记忆目录——只有工具返回的内容你才看得到。" +
+                    "这些函数：检索类是只读的；压缩/审计只写事实卡与报告，不动原文。" +
+                    "★铁律：查记忆只用下面这些工具；禁止用 <Python>、glob、读文件、`sqlite3` 去翻记忆目录或索引库——" +
+                    "那属于本工具的职责，绕过工具既慢又容易拿到过期/未整理的数据。" +
                     "<memrecall query=\"关键词\"/> 查书签；" +
                     "<memwhen time=\"上周三\" keyword=\"可选\" limit=\"8\"/> 按时间翻旧账；" +
                     "<memfetch source=\"memory_xxx.md\" 或 keyword=\"关键词\" limit=\"3\"/> 取原文；" +
@@ -197,7 +236,8 @@ public class MemoryInjectModule(
                     "<memaudit/> 手动审一次事实卡；" +
                     "<memlinks query=\"俾斯麦\"/> 看某个词/人/物常和什么一起出现。",
             };
-            functionCaller.RegisterHandler(handler, DocumentMode.Implicit, DestroyCancellationToken);
+            // Explicit：每轮把工具说明/参数表注入系统提示。Implicit 只露一行，模型常不知道有这些工具。
+            functionCaller.RegisterHandler(handler, DocumentMode.Explicit, DestroyCancellationToken);
         }
         catch (Exception e)
         {
@@ -355,39 +395,161 @@ public class MemoryInjectModule(
         catch (Exception e) { return "生成视图失败：" + e.Message; }
     }
 
-    /// <summary>供管理页调用：重建本角色的记忆索引，返回结果文字。</summary>
-    public async Task<string> RebuildIndexAsync()
+    /// <summary>构建前预览：只统计来源和排除规则，不写索引。</summary>
+    public string PreviewBuild()
     {
         try
         {
+            var rows = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            int total = 0;
+            foreach (var item in EnumerateAllMemoryFiles())
+            {
+                total++;
+                string key = item.file.StartsWith(roleRoot, StringComparison.OrdinalIgnoreCase) ? item.file.Substring(roleRoot.Length).TrimStart('\\', '/') : item.file;
+                key = key.Split(new[] { '\\', '/' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "?";
+                rows[key] = rows.TryGetValue(key, out int n) ? n + 1 : 1;
+            }
+            string excluded = string.Join(", ", ExcludeSnapshot());
+            return "本次预计扫描 " + total + " 个文件；来源：" + string.Join(", ", rows.Select(x => x.Key + "=" + x.Value)) +
+                   "；排除：" + (excluded.Length == 0 ? "无" : excluded) + "；索引只写入 MemoryFacts，官方来源只读。";
+        }
+        catch (Exception e) { return "预览失败：" + e.Message; }
+    }
+
+    void WriteManifest(string result)
+    {
+        try
+        {
+            string path = Path.Combine(factsRoot, "index_manifest.json");
+            var manifest = new { version = "next", builtAt = DateTime.Now, blockMax = Configuration?.BlockMaxChars ?? 200,
+                exclude = ExcludeSnapshot(), roots = memoryRoots.Select(x => x.root).ToArray(), result };
+            File.WriteAllText(path, JsonSerializer.Serialize(manifest, new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch (Exception e) { logger.LogWarning(e, "记忆书签：写入索引构建指纹失败"); }
+    }
+
+    /// <summary>供管理页调用：重建索引；失败时保留原库，成功后备份上一个版本。</summary>
+    public async Task<string> RebuildIndexAsync() => await RebuildIndexCoreAsync(forceClean: false).ConfigureAwait(false);
+
+    /// <summary>兼容原有按钮语义：按当前规则完整扫描；新库成功之前不删除旧库。</summary>
+    public async Task<string> RebuildCleanAsync() => await RebuildIndexCoreAsync(forceClean: true).ConfigureAwait(false);
+
+    async Task<string> RebuildIndexCoreAsync(bool forceClean)
+    {
+        if (!await rebuildLock.WaitAsync(0).ConfigureAwait(false)) return "已有索引重建在运行，请等待完成。";
+        string dbPath = Path.Combine(factsRoot, "memory.db");
+        string indexBackup = "";
+        string dbBackup = "";
+        string jsonBackup = "";
+        string dbSwap = "";
+        string tempDir = Path.Combine(factsRoot, ".rebuild-" + Guid.NewGuid().ToString("N"));
+        string tempIndex = Path.Combine(tempDir, "index.json");
+        string tempDb = Path.Combine(tempDir, "memory.db");
+        try
+        {
+            Directory.CreateDirectory(factsRoot);
+            if (string.IsNullOrWhiteSpace(memoryRoot) || !Directory.Exists(memoryRoot))
+                return "重建取消：记忆根目录不存在，旧索引保持不变。";
+            if (!sidecar.IsReady) return "重建失败：侧车未就绪，旧索引保持不变。";
             EnsureExcludes();
-            string? r = await sidecar.AskAsync("build",
+            Directory.CreateDirectory(tempDir);
+
+            // 先释放当前库句柄，Windows 下才能安全替换数据库文件；不删除旧库。
+            var closeOld = await sidecar.AskJsonAsync("close", new Dictionary<string, object?>(), 15000, indexPath).ConfigureAwait(false);
+            if (closeOld == null) return "重建失败：无法释放旧索引连接，旧索引保持不变。";
+            if (forceClean)
+            {
+                var reset = await sidecar.AskJsonAsync("reset", new Dictionary<string, object?>(), 15000, tempIndex).ConfigureAwait(false);
+                if (reset == null || !reset.Value.TryGetProperty("ok", out JsonElement resetOk) || !resetOk.GetBoolean())
+                    return "重建失败：无法准备隔离的新库，旧索引保持不变。";
+            }
+
+            string? result = await sidecar.AskAsync("build",
                 new Dictionary<string, object?>
                 {
                     ["memdir"] = memoryRoot,
-                    ["out"] = indexPath,
+                    ["out"] = tempIndex,
                     ["block_max"] = (Configuration?.BlockMaxChars ?? 200),
-                    ["extra"] = new[] { factsRoot },
+                    ["extra"] = BuildExtraRoots(),
                     ["exclude"] = ExcludeSnapshot(),
-                },
-                180000, indexPath).ConfigureAwait(false);
-            return "索引重建完成：" + (r ?? "").Trim();
+                }, 180000, tempIndex).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(result)) return "重建失败或超时：旧索引保持不变。";
+            if (!File.Exists(tempDb)) return "重建失败：新数据库未生成，旧索引保持不变。";
+            var closeNew = await sidecar.AskJsonAsync("close", new Dictionary<string, object?>(), 15000, tempIndex).ConfigureAwait(false);
+            if (closeNew == null) return "重建失败：无法释放新索引连接，旧索引保持不变。";
+
+            string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+            if (File.Exists(indexPath))
+            {
+                indexBackup = indexPath + ".bak-" + stamp;
+                File.Copy(indexPath, indexBackup, false);
+            }
+            if (File.Exists(dbPath))
+            {
+                dbBackup = dbPath + ".bak-" + stamp;
+                File.Copy(dbPath, dbBackup, false);
+            }
+            if (File.Exists(indexPath))
+            {
+                jsonBackup = indexPath + ".swap-" + Guid.NewGuid().ToString("N");
+                File.Move(indexPath, jsonBackup);
+            }
+            try
+            {
+                if (File.Exists(dbPath))
+                {
+                    dbSwap = dbPath + ".swap-" + Guid.NewGuid().ToString("N");
+                    File.Move(dbPath, dbSwap);
+                }
+                File.Move(tempDb, dbPath);
+                if (File.Exists(tempIndex)) File.Delete(tempIndex);
+                if (File.Exists(jsonBackup)) File.Delete(jsonBackup);
+            }
+            catch
+            {
+                if (!File.Exists(dbPath) && dbSwap.Length > 0 && File.Exists(dbSwap)) File.Move(dbSwap, dbPath);
+                if (!File.Exists(indexPath) && File.Exists(jsonBackup)) File.Move(jsonBackup, indexPath);
+                throw;
+            }
+            await sidecar.AskAsync("stats", new Dictionary<string, object?>(), 5000, indexPath).ConfigureAwait(false);
+            WriteManifest(result.Trim());
+            lastBuildCheck = DateTime.MinValue;
+            return "安全重建完成：" + result.Trim() + "；原索引备份：" + (dbBackup.Length > 0 ? dbBackup : (indexBackup.Length > 0 ? indexBackup : "无旧库"));
         }
-        catch (Exception e) { return "重建索引失败：" + e.Message; }
+        catch (Exception e)
+        {
+            logger.LogWarning(e, "记忆书签：安全索引重建失败");
+            return "重建失败，旧索引已保留" + (dbBackup.Length > 0 ? "（备份：" + dbBackup + "）" : "") + "：" + e.Message;
+        }
+        finally
+        {
+            try { if (File.Exists(tempIndex)) File.Delete(tempIndex); } catch { }
+            try { if (File.Exists(tempDb)) File.Delete(tempDb); } catch { }
+            try { if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true); } catch { }
+            // ★换库成功后 swap 文件会留着（每份几十~几百 MB），必须清掉
+            try { if (dbSwap.Length > 0 && File.Exists(dbSwap)) File.Delete(dbSwap); } catch { }
+            try { if (jsonBackup.Length > 0 && File.Exists(jsonBackup)) File.Delete(jsonBackup); } catch { }
+            PruneBackups();
+            rebuildLock.Release();
+        }
     }
 
-    /// <summary>管理页：清空索引库后按当前配置全量重建（官方文件、事实卡都不动）。</summary>
-    public async Task<string> RebuildCleanAsync()
+    /// <summary>只保留最近 2 份备份，避免 MemoryFacts 被 .bak 撑爆（每份几十~几百 MB）。</summary>
+    void PruneBackups()
     {
         try
         {
-            await sidecar.AskAsync("reset", new Dictionary<string, object?>(), 15000, indexPath).ConfigureAwait(false);
-            string dbp = Path.Combine(factsRoot, "memory.db");
-            try { if (File.Exists(dbp)) File.Delete(dbp); } catch { }
-            try { if (File.Exists(indexPath)) File.Delete(indexPath); } catch { }
-            return "干净库已重建：" + await RebuildIndexAsync().ConfigureAwait(false);
+            foreach (string pat in new[] { "memory.db.bak-*", "index.json.bak-*" })
+            {
+                var files = Directory.GetFiles(factsRoot, pat).OrderByDescending(f => f, StringComparer.Ordinal).ToList();
+                foreach (string old in files.Skip(2))
+                    try { File.Delete(old); } catch { }
+            }
+            // 换库失败/中断留下的 swap 副本（每份几十~几百 MB），启动和重建后都清掉
+            foreach (string sw in Directory.GetFiles(factsRoot, "*.swap-*"))
+                try { File.Delete(sw); } catch { }
         }
-        catch (Exception e) { return "重建干净库失败：" + e.Message; }
+        catch { }
     }
 
     protected override Task OnDestroy()
@@ -411,7 +573,7 @@ public class MemoryInjectModule(
             if (hasMemory == false && (DateTime.Now - lastMemCheck).TotalSeconds >= 60)
             {
                 lastMemCheck = DateTime.Now;
-                try { hasMemory = HasMemoryFiles(memoryRoot); } catch { }
+                try { hasMemory = memoryRoots.Any(x => HasMemoryFiles(x.root)); } catch { }
             }
             if (hasMemory == false) return message;
 
@@ -435,14 +597,14 @@ public class MemoryInjectModule(
             int waitMs = Math.Max(Configuration.SyncWaitMs, 200);
             if (warmDone == false) waitMs = Math.Max(waitMs, 5000);   // 预热未完成：给大库冷读留出时间，别当没命中
             // ★SkipRecentDays 只作用于"自动书签"（按条目日期跳过最近 N 天）；手动工具传 0，永不跳过
-            string? bookmarks = sidecar.RecallSync(stripped, waitMs, indexPath, Configuration.HalfLifeDays, Configuration.UseGraph, Configuration.SkipRecentDays);
+            string? bookmarks = sidecar.RecallSync(stripped, waitMs, indexPath, Configuration.HalfLifeDays, Configuration.UseGraph, Configuration.SkipRecentDays, Configuration.MaxResults);
             if (string.IsNullOrWhiteSpace(bookmarks) == false)
             {
                 // ★只追加：书签拼在本轮用户消息末尾，用户原话一字不动。
                 //   框架 ChatSend 的返回值即本轮新消息内容（会进历史），前缀不变，前缀缓存照常命中。
                 string tail = Configuration.ToolFirst
                     ? "\n[要用全文：调 <memfetch source=\"出处文件名\"/> 或 <memwhen time=\"上周三\"/>，不要扫盘、不要凭印象编。]"
-                    : "\n[要用全文：去 " + memoryRoot + " 翻对应那份，别凭印象编。]";
+                    : "\n[要用全文：调 <memfetch source=\"出处文件名\"/>，别凭印象编。]";
                 string block =
                     "[记忆书签·临时·仅本轮参考（按人/事/物查 index.json）]\n" + bookmarks + tail;
                 logger.LogInformation("记忆回忆提示：按人事物命中，已附书签");
@@ -509,10 +671,20 @@ public class MemoryInjectModule(
     public async Task<string> Recall(
         [Description("要查的内容，比如某人、某件事、某个物件")] string query)
     {
-        string? bm = await sidecar.RecallAsync(query, 5000, indexPath, Configuration.HalfLifeDays, Configuration.UseGraph).ConfigureAwait(false);
-        string msg = string.IsNullOrWhiteSpace(bm)
-            ? $"记忆里没翻到跟「{query}」相关的旧账。可以换 memwhen 按时间找，或换个关键词。"
-            : bm!;
+        // ★区分两种情况：真的没命中 vs 侧车没响应（超时/报错）。旧版一律说"没翻到"，误导排查。
+        JsonElement? r = await sidecar.AskJsonAsync("recall", new Dictionary<string, object?>
+        {
+            ["query"] = query ?? "",
+            ["top_k"] = Math.Clamp(Configuration.MaxResults, 1, 20),
+            ["half_life"] = Configuration.HalfLifeDays,
+            ["use_graph"] = Configuration.UseGraph,
+        }, 8000, indexPath).ConfigureAwait(false);
+        string? bm = (r != null && r.Value.TryGetProperty("bookmarks", out JsonElement bEl)) ? (bEl.GetString() ?? "") : null;
+        string msg = bm == null
+            ? $"召回没响应（侧车未就绪或超时），不是没有记忆。稍后再试，或用 memstatus 看侧车状态。"
+            : string.IsNullOrWhiteSpace(bm)
+                ? $"记忆里没翻到跟「{query}」相关的旧账。可以换 memwhen 按时间找，或换个关键词。"
+                : bm!;
         Echo(msg);
         return msg;
     }
@@ -559,19 +731,64 @@ public class MemoryInjectModule(
         catch (Exception e) { return "按时间查失败：" + e.Message; }
     }
 
-    /// <summary>索引体量/覆盖范围。</summary>
+    [XmlFunction(FunctionMode.OneShot, "memdebug")]
+    [Description("解释一次记忆召回：显示候选数量、关键词/语义模式、阈值、最近过滤与最终结果，排查为什么召回为空。")]
+    public async Task<string> DebugRecall(string query, int top = 5)
+    {
+        try
+        {
+            string? text = await sidecar.AskAsync("debug", new Dictionary<string, object?>
+            {
+                ["query"] = query ?? "", ["top_k"] = top, ["skip_recent_days"] = 0,
+                ["use_graph"] = Configuration.UseGraph
+            }, 8000, indexPath).ConfigureAwait(false);
+            return R(string.IsNullOrWhiteSpace(text) ? "调试查询无结果（侧车可能未就绪）。" : text!);
+        }
+        catch (Exception e) { return "召回调试失败：" + e.Message; }
+    }
+
+    /// <summary>索引体量/覆盖范围及诊断信息。</summary>
     [XmlFunction(FunctionMode.OneShot, "memstatus")]
-    [Description("看一眼记忆索引的体量与覆盖时间范围。不确定有没有记忆、或怀疑索引没更新时用。")]
+    [Description("诊断记忆根目录、索引新旧、排除规则与侧车状态。怀疑没扫到记忆或召回为空时使用。")]
     public async Task<string> Status()
     {
         try
         {
             string? txt = await sidecar.AskAsync("stats", new Dictionary<string, object?>(), 5000, indexPath).ConfigureAwait(false);
-            string file = File.Exists(indexPath)
-                ? "；索引文件 " + Math.Round(new FileInfo(indexPath).Length / 1024.0 / 1024.0, 1) + " MB，更新于 " +
-                  File.GetLastWriteTime(indexPath).ToString("MM-dd HH:mm")
-                : "；索引文件还不存在";
-            return R((string.IsNullOrWhiteSpace(txt) ? "索引读不出来（侧车可能没就绪）。" : txt!) + file + "；记忆目录 " + memoryRoot);
+            string dbPath = Path.Combine(factsRoot, "memory.db");
+            string store = File.Exists(dbPath) ? dbPath : indexPath;
+            string storeInfo = File.Exists(store)
+                ? "索引文件 " + Math.Round(new FileInfo(store).Length / 1024.0 / 1024.0, 1) + " MB，更新于 " + File.GetLastWriteTime(store).ToString("yyyy-MM-dd HH:mm")
+                : "索引文件不存在";
+            string newest = "未知";
+            int fileCount = 0, l1Count = 0, otherCount = 0;
+            var sourceSummary = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            DateTime newestTime = DateTime.MinValue;
+            string[] excluded = ExcludeSnapshot();
+            foreach (var item in EnumerateAllMemoryFiles())
+            {
+                fileCount++;
+                string rel = item.source;
+                string sourceName = item.file.StartsWith(roleRoot, StringComparison.OrdinalIgnoreCase) ? item.file.Substring(roleRoot.Length).TrimStart('\\', '/') : item.file;
+                sourceName = sourceName.Split(new[] { '\\', '/' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "?";
+                sourceSummary[sourceName] = sourceSummary.TryGetValue(sourceName, out int prior) ? prior + 1 : 1;
+                if (rel.StartsWith("L1/", StringComparison.OrdinalIgnoreCase) || rel.IndexOf("/L1/", StringComparison.OrdinalIgnoreCase) >= 0) l1Count++;
+                else otherCount++;
+                try { if (File.GetLastWriteTime(item.file) > newestTime) newestTime = File.GetLastWriteTime(item.file); } catch { }
+            }
+            if (newestTime > DateTime.MinValue) newest = newestTime.ToString("yyyy-MM-dd HH:mm");
+            DateTime storeTime = File.Exists(store) ? File.GetLastWriteTime(store) : DateTime.MinValue;
+            string freshness = newestTime == DateTime.MinValue ? "无源文件"
+                : !File.Exists(store) ? "待建索引"
+                : newestTime > storeTime ? "索引可能落后（有更新源文件）" : "索引时间不早于源文件";
+            bool excludesL1 = excluded.Any(x => x.Equals("L1/", StringComparison.OrdinalIgnoreCase));
+            string rule = string.Join(", ", excluded);
+            if (rule.Length == 0) rule = "（无）";
+            return R((string.IsNullOrWhiteSpace(txt) ? "索引统计暂不可用（侧车可能未就绪）。" : txt!) +
+                "｜根目录 " + memoryRoot + "｜来源文件 " + fileCount + "（L1 " + l1Count + "，其他 " + otherCount + "）" +
+                "｜来源分布 " + string.Join(", ", sourceSummary.Select(x => x.Key + ":" + x.Value)) +
+                "｜排除 " + rule + "｜L1 " + (excludesL1 ? "已排除" : "未排除") +
+                "｜最新源文件 " + newest + "｜" + freshness + "｜" + storeInfo + "｜侧车 " + sidecar.Status);
         }
         catch (Exception e) { return "看索引状态失败：" + e.Message; }
     }
@@ -596,6 +813,26 @@ public class MemoryInjectModule(
         catch (Exception e) { return "查图谱失败：" + e.Message; }
     }
 
+    /// <summary>压缩候选预览，不调用模型、不写文件。</summary>
+    [XmlFunction(FunctionMode.OneShot, "memcompactpreview")]
+    [Description("预览哪些记忆流水达到自动压缩门槛；只读，不调用模型，不写事实卡。")]
+    public async Task<string> CompactPreview()
+    {
+        try
+        {
+            JsonElement? scan = await sidecar.AskJsonAsync("compactscan", new Dictionary<string, object?>
+            {
+                ["memdir"] = memoryRoot, ["min_entries"] = Configuration.AutoCompactMinEntries,
+                ["min_age_days"] = Configuration.AutoCompactMinAgeDays, ["max_chars"] = 0,   // probe：只数候选，不抓正文
+                ["top_k"] = 100, ["exclude"] = ExcludeSnapshot()
+            }, 15000, indexPath).ConfigureAwait(false);
+            if (scan == null || !scan.Value.TryGetProperty("candidates", out JsonElement items)) return R("压缩候选暂时读不到（侧车可能未就绪）。");
+            int n = items.ValueKind == JsonValueKind.Array ? items.GetArrayLength() : 0;
+            return R("当前有 " + n + " 个压缩候选；门槛为至少 " + Configuration.AutoCompactMinEntries + " 条且至少 " + Configuration.AutoCompactMinAgeDays + " 天。确认后再调用 memcompact。" );
+        }
+        catch (Exception e) { return "预览压缩失败：" + e.Message; }
+    }
+
     /// <summary>① 手动触发一次压缩。</summary>
     [XmlFunction(FunctionMode.OneShot, "memcompact")]
     [Description("把条目多且够旧的记忆流水压成事实卡（只把来源记为「已压缩」、不再进索引，官方文件原样不动）。")]
@@ -614,7 +851,7 @@ public class MemoryInjectModule(
     public async Task<string> Audit()
     {
         int n = await AuditAsync(force: true).ConfigureAwait(false);
-        string report = Path.Combine(memoryRoot, "审计报告_" + DateTime.Now.ToString("yyyyMMdd") + ".md");
+        string report = Path.Combine(factsRoot, "审计报告_" + DateTime.Now.ToString("yyyyMMdd") + ".md");
         string msg = n > 0 ? ("审计新增 " + n + " 条问题，报告：" + report) : "没发现新的重复或矛盾。";
         return R(msg);
     }
@@ -651,10 +888,10 @@ public class MemoryInjectModule(
     /// </summary>
     DateTime NewestMemoryStamp(string root)
     {
-        DateTime newest = Directory.GetLastWriteTime(root);
-        foreach (string f in EnumerateMemoryFiles(root))
+        DateTime newest = Directory.Exists(root) ? Directory.GetLastWriteTime(root) : DateTime.MinValue;
+        foreach (var item in EnumerateAllMemoryFiles())
         {
-            try { DateTime t = File.GetLastWriteTime(f); if (t > newest) newest = t; } catch { }
+            try { DateTime t = File.GetLastWriteTime(item.file); if (t > newest) newest = t; } catch { }
         }
         return newest;
     }
@@ -688,8 +925,9 @@ public class MemoryInjectModule(
             vectorsReady = false;
 
             DateTime cutoff = DateTime.Now.AddDays(-Math.Max(0, Configuration.SkipRecentDays));
-            foreach (string file in EnumerateMemoryFiles(memoryRoot))
+            foreach (var item in EnumerateAllMemoryFiles())
             {
+                string file = item.file;
                 try
                 {
                     if (File.GetLastWriteTime(file) >= cutoff) continue;
@@ -721,24 +959,65 @@ public class MemoryInjectModule(
 
     // ===== 向量 =====
 
+    static IEnumerable<string> EnumerateFilesSafe(string root)
+    {
+        var pending = new Stack<string>();
+        pending.Push(root);
+        while (pending.Count > 0)
+        {
+            string dir = pending.Pop();
+            IEnumerable<string> files;
+            try { files = Directory.EnumerateFiles(dir, "*", SearchOption.TopDirectoryOnly).ToArray(); }
+            catch { continue; }
+            foreach (string file in files)
+            {
+                string ext = Path.GetExtension(file);
+                if (ext.Equals(".md", StringComparison.OrdinalIgnoreCase) || ext.Equals(".txt", StringComparison.OrdinalIgnoreCase))
+                    yield return file;
+            }
+            IEnumerable<string> dirs;
+            try { dirs = Directory.EnumerateDirectories(dir, "*", SearchOption.TopDirectoryOnly).ToArray(); }
+            catch { continue; }
+            foreach (string child in dirs)
+            {
+                string name = Path.GetFileName(child);
+                if (name.StartsWith(".", StringComparison.Ordinal) ||
+                    name.Equals("settled", StringComparison.OrdinalIgnoreCase) ||
+                    name.Equals("backup", StringComparison.OrdinalIgnoreCase) ||
+                    name.Equals("archive", StringComparison.OrdinalIgnoreCase) ||
+                    name.Equals("MemoryFacts", StringComparison.OrdinalIgnoreCase)) continue;
+                pending.Push(child);
+            }
+        }
+    }
+
     /// <summary>枚举记忆目录下的记忆文件（兼容 .md 与 .txt；跳过已压缩来源——它们只是不进我们的索引）。</summary>
     IEnumerable<string> EnumerateMemoryFiles(string root)
     {
         EnsureExcludes();
-        // 快照一次：HashSet 在后台线程会被改写，边遍历边判断会炸
         string[] exSnapshot = ExcludeSnapshot();
-        string[] skip = { "settled", "backup", "archive", "MemoryFacts" };
-        foreach (string pat in new[] { "*.md", "*.txt" })
-            foreach (string f in Directory.EnumerateFiles(root, pat, SearchOption.AllDirectories))
-            {
-                string rel = f.Substring(root.Length).Replace('\\', '/');
-                if (rel.Contains(".bak", StringComparison.OrdinalIgnoreCase)) continue;
-                if (IsExcludedRel(rel, exSnapshot)) continue;   // 已压缩/手动排除：只跳过索引
-                bool skipIt = false;
-                foreach (string d in skip)
-                    if (rel.Contains("/" + d + "/")) { skipIt = true; break; }
-                if (!skipIt) yield return f;
-            }
+        if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root)) yield break;
+        foreach (string f in EnumerateFilesSafe(root))
+        {
+            string rel = f.Substring(root.Length).Replace('\\', '/').TrimStart('/');
+            if (rel.Contains(".bak", StringComparison.OrdinalIgnoreCase)) continue;
+            if (IsExcludedRel(rel, exSnapshot)) continue;
+            yield return f;
+        }
+    }
+
+    string[] BuildExtraRoots()
+    {
+        var roots = memoryRoots.Skip(1).Select(x => x.root).Where(Directory.Exists).ToList();
+        roots.Add(factsRoot);
+        return roots.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    IEnumerable<(string file, string source)> EnumerateAllMemoryFiles()
+    {
+        foreach (var item in memoryRoots.ToArray())
+            foreach (string f in EnumerateMemoryFiles(item.root))
+                yield return (f, item.prefix + f.Substring(item.root.Length).Replace('\\', '/').TrimStart('/'));
     }
 
     /// <summary>
@@ -765,18 +1044,24 @@ public class MemoryInjectModule(
             {
                 DateTime idxTime = File.Exists(dbPath) ? File.GetLastWriteTime(dbPath) : File.GetLastWriteTime(indexPath);
                 DateTime newest = idxTime;
-                foreach (string f in EnumerateMemoryFiles(memoryRoot))
+                foreach (var item in EnumerateAllMemoryFiles())
                 {
-                    try { DateTime t = File.GetLastWriteTime(f); if (t > newest) newest = t; } catch { }
+                    try { DateTime t = File.GetLastWriteTime(item.file); if (t > newest) newest = t; } catch { }
                 }
                 need = newest > idxTime;   // 有比索引还新的记忆 → 重建
             }
+            string manifestPath = Path.Combine(factsRoot, "index_manifest.json");
+            if (need == false && !File.Exists(manifestPath)) need = true;
             if (need == false) return;
 
             EnsureExcludes();
             var r = await sidecar.BuildAsync(memoryRoot, indexPath, blockMax: Configuration.BlockMaxChars,
-                extra: new[] { factsRoot }, exclude: ExcludeSnapshot()).ConfigureAwait(false);
-            if (r != null) logger.LogInformation("记忆书签：索引已重建 {N} 条 -> {Out}", r.Value.count, r.Value.outPath);
+                extra: BuildExtraRoots(), exclude: ExcludeSnapshot()).ConfigureAwait(false);
+            if (r != null)
+            {
+                WriteManifest("auto: " + r.Value.count + " entries");
+                logger.LogInformation("记忆书签：索引已重建 {N} 条 -> {Out}", r.Value.count, r.Value.outPath);
+            }
             else logger.LogWarning("记忆书签：索引重建未成功（不影响主流程）");
         }
         catch (Exception e)
@@ -797,17 +1082,34 @@ public class MemoryInjectModule(
 
         // 读水位：已整理过的 文件相对路径|mtime 集合
         var done = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var legacyDone = new HashSet<string>(StringComparer.OrdinalIgnoreCase);   // 旧 mtime 水位对应的路径
+        DateTime stateTime = DateTime.MinValue;                                  // 水位文件写盘时间
+        try { if (File.Exists(llmStatePath)) stateTime = File.GetLastWriteTime(llmStatePath); } catch { }
         try
         {
             if (File.Exists(llmStatePath))
                 foreach (string ln in File.ReadAllLines(llmStatePath))
-                    if (string.IsNullOrWhiteSpace(ln) == false) done.Add(ln.Trim());
+                {
+                    string one = ln.Trim();
+                    if (one.Length == 0) continue;
+                    // 旧格式 relPath|mtimeTicks：只记路径，避免升级后整库重喂；不写回新水位
+                    int bar = one.IndexOf('|');
+                    if (bar > 0 && one.Substring(bar + 1).Length > 0 && one.Substring(bar + 1).All(char.IsDigit))
+                    {
+                        legacyDone.Add(one.Substring(0, bar));
+                        continue;
+                    }
+                    done.Add(one);
+                }
         }
         catch { }
 
-        // ★与 ① 协调：压缩开着时，"条目多且够旧"的文件留给 compact，organize 不重复喂模型
+        // ★与 ① 协调：只有压缩"最近健康"时才把待压缩文件留给它，
+        //   否则压缩一直失败（侧车没就绪/模型报错）会把文件饿死、永远不产事实卡。
+        bool compactHealthy = Configuration.AutoCompactEnable
+            && (DateTime.Now - lastCompactOk).TotalMinutes < Math.Max(30, Configuration.AutoCompactMinutes) * 2;
         var pendingCompact = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        if (Configuration.AutoCompactEnable)
+        if (compactHealthy)
         {
             try
             {
@@ -816,7 +1118,7 @@ public class MemoryInjectModule(
                     ["memdir"] = memoryRoot,
                     ["min_entries"] = Configuration.AutoCompactMinEntries,
                     ["min_age_days"] = Configuration.AutoCompactMinAgeDays,
-                    ["max_chars"] = 1,
+                    ["max_chars"] = 0,   // probe：只问"哪些文件待压缩"，不抓正文
                     ["top_k"] = 500,
                     ["exclude"] = ExcludeSnapshot(),
                 };
@@ -834,35 +1136,56 @@ public class MemoryInjectModule(
         }
 
         // 找出没整理过的记忆文件（跳过事实卡本身、索引、状态文件）
+        // ★关键顺序：先收集全部候选 → 按修改时间从新到旧排序 → 再按预算选材。
+        //   旧实现边枚举边扣预算、最后才排序，枚举顺序（目录/文件名）会让老档先吃光预算，新档永远轮不到。
         var fresh = new List<(string path, string key, string text, DateTime mt)>();
         int budget = Math.Max(2000, Configuration.LlmOrganizeMaxChars);
         try
         {
-            foreach (string f in EnumerateMemoryFiles(memoryRoot))
+            var cands = new List<(string path, string key, string rel, DateTime mt, string text)>();
+            foreach (var item in EnumerateAllMemoryFiles())
             {
+                string f = item.file;
                 string name = Path.GetFileName(f);
                 if (name.StartsWith("事实_") || name.StartsWith("审计报告_")
                     || name == "index.json" || name == "llm_organize_state.txt"
                     || name == "compacted_sources.txt" || name.EndsWith("记忆索引视图.html")) continue;
-                string relPath = f.Substring(memoryRoot.Length).Replace('\\', '/').TrimStart('/');
-                if (pendingCompact.Count > 0 && pendingCompact.Contains(relPath)) continue;   // 留给压缩
+                string relPath = item.source;
+                if (compactHealthy && pendingCompact.Contains(relPath)) continue;   // 留给压缩
                 DateTime mt;
                 try { mt = File.GetLastWriteTime(f); } catch { continue; }
-                string key = relPath + "|" + mt.Ticks;
-                if (done.Contains(key)) continue;
                 string txt;
                 try { txt = File.ReadAllText(f); } catch { continue; }
+                // ★水位用内容哈希而不是 mtime：文件被 touch/复制/还原不会重喂，内容真变了才重整理
+                string key = relPath + "|" + ContentKey(txt);
+                if (done.Contains(key)) continue;
+                if (legacyDone.Contains(relPath))
+                {
+                    // 旧水位：只有文件在水位写盘之后没再改过，才算"已处理"；
+                    // 改过就按新内容整理，避免升级后漏掉最后一次改动。
+                    if (mt <= stateTime.AddSeconds(5)) { done.Add(key); continue; }
+                }
                 if (string.IsNullOrWhiteSpace(txt)) { done.Add(key); continue; }
-                // ★超预算就跳过这一份，绝不 break：否则老文件把预算吃光，新档永远轮不到
-                if (txt.Length > budget) continue;
-                fresh.Add((f, key, txt, mt));
+                cands.Add((f, key, relPath, mt, txt));
+            }
+            // 新→旧：新流水优先
+            cands.Sort((x, y) => y.mt.CompareTo(x.mt));
+            foreach (var c in cands)
+            {
+                if (budget <= 0) break;
+                string txt = c.text;
+                if (txt.Length > budget)
+                {
+                    // ★超预算截断而不是整份跳过：跳过会让超大文件永远排不上（旧代码就是截断，别退化）
+                    logger.LogWarning("记忆书签：整理截断超大文件 {f}（{n} 字 > 预算 {b}）", c.rel, txt.Length, budget);
+                    txt = txt.Substring(0, budget);
+                }
+                if (txt.Length == 0) continue;
+                fresh.Add((c.path, c.key, txt, c.mt));
                 budget -= txt.Length;
             }
         }
         catch (Exception e) { logger.LogWarning(e, "记忆书签：模型整理扫描失败"); return; }
-
-        // ★按修改时间从新到旧：新流水优先，别让老文件把预算耗光
-        fresh.Sort((x, y) => y.mt.CompareTo(x.mt));
 
         if (fresh.Count == 0) return;
 
@@ -900,14 +1223,26 @@ public class MemoryInjectModule(
         TrySaveState(done);
     }
 
+    /// <summary>内容指纹（文件内容变了才变），水位用它，避免 mtime 抖动导致反复重喂。</summary>
+    static string ContentKey(string text)
+    {
+        try
+        {
+            byte[] h = System.Security.Cryptography.SHA1.HashData(System.Text.Encoding.UTF8.GetBytes(text ?? ""));
+            return Convert.ToHexString(h).Substring(0, 12);
+        }
+        catch { return (text ?? "").Length.ToString(); }
+    }
+
     void TrySaveState(HashSet<string> done)
     {
         try
         {
-            // 只留最近 500 条水位，别无限长
-            var tail = done.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList();
-            if (tail.Count > 500) tail = tail.Skip(tail.Count - 500).ToList();
-            File.WriteAllLines(llmStatePath, tail);
+            // ★不要按字典序截断：旧实现只留 500 条且按路径排序，超过后会把"路径靠前"的文件
+            //   水位丢掉 → 它们每轮都被当成新文件重新整理（反复重喂）。
+            var all = done.ToList();
+            if (all.Count > 20000) all = all.Take(20000).ToList();   // 只是防病态膨胀
+            File.WriteAllLines(llmStatePath, all);
         }
         catch (Exception e) { logger.LogWarning(e, "记忆书签：模型整理水位写盘失败"); }
     }
@@ -952,15 +1287,20 @@ public class MemoryInjectModule(
     static bool IsExcludedRel(string rel, string[] list)
     {
         if (string.IsNullOrEmpty(rel)) return false;
-        string r = rel.Replace('\\', '/').TrimStart('/');
-        foreach (string one in list)
+        string r = rel.Replace('\\', '/').Trim('/');
+        if (r.Length == 0) return false;
+        string hay = "/" + r + "/";
+        foreach (string raw in list)
         {
-            if (string.IsNullOrEmpty(one)) continue;
-            if (one.EndsWith("/"))
+            if (string.IsNullOrEmpty(raw)) continue;
+            string one = raw.Replace('\\', '/').Trim('/');
+            if (one.Length == 0) continue;
+            // 目录前缀在任意层级生效：填 L1/ 也能排掉 facts/L1/、Memory/L1/
+            if (raw.Replace('\\', '/').EndsWith("/"))
             {
-                if (r.StartsWith(one, StringComparison.OrdinalIgnoreCase)) return true;
+                if (hay.Contains("/" + one + "/", StringComparison.OrdinalIgnoreCase)) return true;
             }
-            else if (string.Equals(r, one, StringComparison.OrdinalIgnoreCase)) return true;
+            else if (hay.Contains("/" + one + "/", StringComparison.OrdinalIgnoreCase)) return true;
         }
         return false;
     }
@@ -1064,8 +1404,10 @@ public class MemoryInjectModule(
             if (root.Value.TryGetProperty("candidates", out JsonElement cands) == false || cands.ValueKind != JsonValueKind.Array)
                 return 0;
 
+            bool anyCand = false;
             foreach (JsonElement c in cands.EnumerateArray())
             {
+                anyCand = true;
                 string source = c.TryGetProperty("source", out JsonElement se) ? (se.GetString() ?? "") : "";
                 string text = c.TryGetProperty("text", out JsonElement te) ? (te.GetString() ?? "") : "";
                 if (string.IsNullOrWhiteSpace(source) || string.IsNullOrWhiteSpace(text)) continue;
@@ -1090,6 +1432,8 @@ public class MemoryInjectModule(
                 done++;
                 logger.LogInformation("记忆书签：已压缩 {src} -> {f}", source, factFile);
             }
+            // 没积压（清单空）或至少压成一份 → 认为压缩链路健康，organize 才敢把文件留给它
+            if (anyCand == false || done > 0) lastCompactOk = DateTime.Now;
         }
         catch (Exception e) { logger.LogWarning(e, "记忆书签：自动压缩失败"); }
         finally { compacting = false; }
@@ -1138,7 +1482,9 @@ public class MemoryInjectModule(
             }
             if (rows.Count == 0) return 0;
 
-            string report = Path.Combine(memoryRoot, "审计报告_" + DateTime.Now.ToString("yyyyMMdd") + ".md");
+            // ★报告写在 factsRoot：官方 Memory/ 只读，一个字节都不写
+            Directory.CreateDirectory(factsRoot);
+            string report = Path.Combine(factsRoot, "审计报告_" + DateTime.Now.ToString("yyyyMMdd") + ".md");
             var known = new HashSet<string>(StringComparer.Ordinal);
             if (File.Exists(report))
                 foreach (string ln in File.ReadAllLines(report))
@@ -1206,19 +1552,20 @@ public class MemoryInjectModule(
         sidecar.Busy = true;
         try
         {
-            if (chunks.Count == 0) return;
+            var list = chunks.ToList();   // ★快照：算向量期间 EnsureChunks 可能重建
+            if (list.Count == 0) return;
             if (sidecar.IsReady == false) return;
-            for (int i = 0; i < chunks.Count; i += 32)
+            for (int i = 0; i < list.Count; i += 32)
             {
-                var batch = chunks.Skip(i).Take(32).Where(c => c.Vector == null).ToList();
+                var batch = list.Skip(i).Take(32).Where(c => c.Vector == null).ToList();
                 if (batch.Count == 0) continue;
                 float[][]? vecs = await sidecar.EmbedAsync(batch.Select(c => c.Text).ToArray()).ConfigureAwait(false);
                 if (vecs == null) return;
                 for (int j = 0; j < batch.Count && j < vecs.Length; j++)
                     batch[j].Vector = vecs[j];
             }
-            vectorsReady = chunks.All(c => c.Vector != null);
-            logger.LogInformation("记忆回忆提示：向量就绪 {Ok}（{N} 段）", vectorsReady, chunks.Count);
+            vectorsReady = list.All(c => c.Vector != null);
+            logger.LogInformation("记忆回忆提示：向量就绪 {Ok}（{N} 段）", vectorsReady, list.Count);
         }
         catch (Exception e)
         {
@@ -1233,7 +1580,7 @@ public class MemoryInjectModule(
 
     List<Chunk> QueryByVector(float[] q)
     {
-        var ready = chunks.Where(c => c.Vector != null).ToList();
+        var ready = chunks.ToList().Where(c => c.Vector != null).ToList();   // 快照，防并发 Clear
         if (ready.Count == 0) return [];
 
         var scored = ready.Select(c => (c, s: Cosine(q, c.Vector!))).ToList();
@@ -1266,7 +1613,8 @@ public class MemoryInjectModule(
         if (qgrams.Count == 0) return [];
 
         var scored = new List<(Chunk c, double s)>();
-        foreach (Chunk c in chunks)
+        var snapshot = chunks.ToList();   // ★后台扫描会 chunks.Clear()，边遍历边改会炸/漏
+        foreach (Chunk c in snapshot)
         {
             var grams = Grams(c.Text);
             if (grams.Count == 0) continue;
