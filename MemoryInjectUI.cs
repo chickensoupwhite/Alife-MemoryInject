@@ -24,6 +24,7 @@ public class MemoryInjectUI : ModuleUIBase<MemoryInjectModule, MemoryInjectConfi
     string query = "";
     string view = "";
     Timer? refreshTimer;
+    volatile bool refreshing;   // 防 5 秒定时器与慢查询重叠
 
     protected override void OnInitialized()
     {
@@ -31,6 +32,8 @@ public class MemoryInjectUI : ModuleUIBase<MemoryInjectModule, MemoryInjectConfi
         // ⑥ 自动刷新：每 5 秒拉一次状态（只读，很轻）
         refreshTimer = new Timer(_ => _ = InvokeAsync(async () =>
         {
+            if (refreshing) return;   // 上一次还没回就跳过，别堆请求
+            refreshing = true;
             try
             {
                 if (Module == null) return;
@@ -38,6 +41,7 @@ public class MemoryInjectUI : ModuleUIBase<MemoryInjectModule, MemoryInjectConfi
                 StateHasChanged();
             }
             catch { }
+            finally { refreshing = false; }
         }), null, 800, 5000);
     }
 
@@ -96,6 +100,15 @@ public class MemoryInjectUI : ModuleUIBase<MemoryInjectModule, MemoryInjectConfi
         b.AddAttribute(i++, "style", GhostStyle);
         b.AddAttribute(i++, "disabled", busy);
         b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this,
+            () => RunAsync(() => Module == null ? Task.FromResult("模块未就绪") : Task.FromResult(Module.PreviewBuild()))));
+        b.AddContent(i++, "预览本次索引");
+        b.CloseElement();
+
+        b.OpenElement(i++, "button");
+        b.AddAttribute(i++, "type", "button");
+        b.AddAttribute(i++, "style", GhostStyle);
+        b.AddAttribute(i++, "disabled", busy);
+        b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this,
             () => RunAsync(() => Module == null ? Task.FromResult("模块未就绪") : Module.RebuildIndexAsync())));
         b.AddContent(i++, "重建索引");
         b.CloseElement();
@@ -115,7 +128,7 @@ public class MemoryInjectUI : ModuleUIBase<MemoryInjectModule, MemoryInjectConfi
         b.AddAttribute(i++, "disabled", busy);
         b.AddAttribute(i++, "onclick", EventCallback.Factory.Create<MouseEventArgs>(this,
             () => RunAsync(() => Module == null ? Task.FromResult("模块未就绪") : Module.RebuildCleanAsync())));
-        b.AddContent(i++, "重建干净库");
+        b.AddContent(i++, "安全重建干净库");
         b.CloseElement();
 
         b.OpenElement(i++, "button");
