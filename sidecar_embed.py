@@ -112,12 +112,17 @@ def _load_index():
         p = _find_index()
         _IDX["path"] = p
     # ★数据库优先：建过库就以库为准（JSON 只用于首次迁移/导出）
+    #   不能要求连接"已经打开"：侧车刚启动时第一个 op 可能是画像/压缩预览/时间查询，
+    #   那时还没人碰过库；这里要自己会开，否则会把索引误读成空。
     try:
-        if p and _DB.get("ok") and _IDX["data"] is None:
-            rows = db_load_all(p)
-            if rows is not None:
-                _IDX["data"] = rows
-                return rows
+        if p and _IDX["data"] is None:
+            _dbp = os.path.join(os.path.dirname(p), "memory.db")
+            if os.path.isfile(_dbp):
+                _c = _db_for(p)
+                if _c is not None:
+                    rows = [_row_entry(_c, r) for r in _c.execute("SELECT * FROM entries")]
+                    _IDX["data"] = rows
+                    return rows
     except Exception:
         pass
     if _IDX["data"] is None:
@@ -412,7 +417,8 @@ def recall(query, top_k=5, min_ratio=0.45, date_from=None, date_to=None, period=
     kw_map = {id(x[3]): x for x in scored}
 
     # 语义路：向量余弦，降序 → 排名（拿不到向量就整体退回纯词频）
-    qv = _embed([query]) if _MODEL["ready"] else None
+    # ★未预热时首次 _embed 会吃 15s CUDA 预热，别让它卡在用户查询里
+    qv = _embed([query]) if (_MODEL["ready"] and _MODEL.get("warmed")) else None
     fused = None
     if qv:
         # ★大库保护：关键词路已按分数降序，只对前 N 条做语义精排。
@@ -567,6 +573,7 @@ def maintain_index(memdir=None, now=None, allow_soft=False):
     today = now or datetime.date.today()
     soft = purged = 0
     keep = []
+    soft_ids, purge_ids = [], []   # ★DB 模式要按 id 落库，不能只改内存
     for e in data:
         # 已经软删的：看多久了，够久就物理清
         if e.get("retired"):
@@ -576,6 +583,7 @@ def maintain_index(memdir=None, now=None, allow_soft=False):
                 rd = today
             if (today - rd).days >= HARD_DELETE_DAYS:
                 purged += 1
+                purge_ids.append(e.get("id"))
                 continue
             keep.append(e)
             continue
@@ -591,12 +599,27 @@ def maintain_index(memdir=None, now=None, allow_soft=False):
             e["retired"] = True
             e["retired_at"] = today.isoformat()
             soft += 1
+            soft_ids.append(e.get("id"))
         keep.append(e)
     if soft or purged:
-        p2 = _IDX.get("path") or _find_index()
-        if p2:
-            io.open(p2, "w", encoding="utf-8").write(json.dumps(keep, ensure_ascii=False, indent=1))
+        c = _db_for(_IDX.get("path"))
+        if c is not None:
+            # ★数据库模式：直接 UPDATE/DELETE，写 JSON 没用（下次读库就丢了）
+            try:
+                if soft_ids:
+                    c.executemany("UPDATE entries SET retired=1, retired_at=? WHERE id=?",
+                                  [(today.isoformat(), i) for i in soft_ids if i])
+                if purge_ids:
+                    c.executemany("DELETE FROM entries WHERE id=?", [(i,) for i in purge_ids if i])
+                c.commit()
+            except Exception:
+                pass
             _IDX["data"] = None
+        else:
+            p2 = _IDX.get("path") or _find_index()
+            if p2:
+                io.open(p2, "w", encoding="utf-8").write(json.dumps(keep, ensure_ascii=False, indent=1))
+                _IDX["data"] = None
     return {"scanned": len(data), "soft_deleted": soft, "purged": purged}
 
 
@@ -930,20 +953,32 @@ def build_index(memdir, outpath=None, extra_dirs=None, exclude=None):
     skip_dirs = {"settled", "backup", "备份", "archive", "MemoryFacts"}
     ex = set(str(x).replace("\\", "/") for x in (exclude or []))
     jobs = [(memdir, "")]
+    used_prefix = {""}
     for d in (extra_dirs or []):
         if d and os.path.isdir(d):
-            jobs.append((d, "facts/"))
+            # ★只有 MemoryFacts 这个目录才叫 facts/；其它记忆根用目录名做前缀。
+            #   否则副记忆根也会被当成"我们自己的事实层"，压缩逻辑会永远跳过它们。
+            base_name = os.path.basename(os.path.normpath(d))
+            pref = "facts/" if base_name.lower() == "memoryfacts" else base_name + "/"
+            if pref in used_prefix:
+                i = 2
+                while "%s%d/" % (base_name, i) in used_prefix:
+                    i += 1
+                pref = "%s%d/" % (base_name, i)
+            used_prefix.add(pref)
+            jobs.append((d, pref))
     allfiles = []
     for base, prefix in jobs:
         for root, dirs, _files in os.walk(base):
             dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith(".")]
             for fn in _files:
-                if fn.lower().endswith((".md", ".txt")) and ".bak" not in fn.lower():
+                if fn.lower().endswith((".md", ".txt")) and ".bak" not in fn.lower() and not _is_meta_file(fn):
                     allfiles.append((os.path.join(root, fn), base, prefix))
     for fpath, base, prefix in sorted(allfiles, key=lambda x: x[0]):
         fname = os.path.basename(fpath)
-        rel = prefix + os.path.relpath(fpath, base).replace("\\", "/")
-        if prefix == "" and _is_excluded(rel, ex):
+        inner = os.path.relpath(fpath, base).replace("\\", "/")
+        rel = prefix + inner
+        if _is_excluded(inner, ex) or _is_excluded(rel, ex):
             continue        # 已压缩/手动排除：只跳过索引，官方文件一个字节都不动
         text = io.open(fpath, encoding="utf-8", errors="ignore").read()
         t = _guess_time(fname, fpath)
@@ -1060,7 +1095,7 @@ def open_loops(keyword=None, limit=20):
     return "\n".join(out)
 
 
-_MODEL = {"ready": False, "tok": None, "mdl": None, "device": "unavailable",
+_MODEL = {"ready": False, "warmed": False, "tok": None, "mdl": None, "device": "unavailable",
           "torch": None, "F": None, "err": ""}
 _VEC_CACHE = {}
 
@@ -1184,16 +1219,23 @@ def compact_scan(memdir, min_entries=30, min_age_days=7, max_chars=20000, top_k=
         if age < int(min_age_days):
             continue
         items.sort(key=lambda x: str(x.get("time") or ""))
-        parts, size = [], 0
+        parts = []
         for x in items:
             who = "".join(x.get("people") or [])
             topic = "".join(x.get("topics") or [])
             summary = str(x.get("summary") or x.get("head") or "").strip()
-            line = " | ".join([str(x.get("date") or ""), who, topic, summary])
-            size += len(line)
-            if size > int(max_chars):
-                break
-            parts.append(line)
+            parts.append(" | ".join([str(x.get("date") or ""), who, topic, summary]))
+        size = sum(len(p) + 1 for p in parts)
+        if int(max_chars) <= 0:
+            # probe 模式：只数候选，不抓正文（预览用）
+            cands.append({"source": src, "entries": len(items), "chars": size,
+                          "date_from": dates[0] if dates else "", "date_to": dates[-1] if dates else "",
+                          "text": ""})
+            continue
+        # ★整份放不进预算就不压：半份压缩后会把来源标记"已压缩"（不再进索引），
+        #   尾巴那部分事实既没进事实卡、又从索引消失 = 静默丢数据
+        if size > int(max_chars):
+            continue
         cands.append({
             "source": src,
             "entries": len(items),
@@ -1268,7 +1310,8 @@ def audit_scan(memdir, limit=30, dup=0.85, near=0.5, max_facts=400):
                 kind = "重复"
             elif same_key and sim >= float(near):
                 kind = "可能重复"
-            elif same_key:
+            elif same_key and str(a.get("date") or "") == str(b.get("date") or ""):
+                # ★同一天才算矛盾：不同天血压 118/91 → 138/98 是变化，不是矛盾（原来大量误报）
                 na = any(w in a["fact"] for w in _NEG)
                 nb = any(w in b["fact"] for w in _NEG)
                 if na != nb:
@@ -1558,7 +1601,7 @@ _DB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS entries(
   id TEXT PRIMARY KEY, anchor TEXT, source TEXT,
   time TEXT, date TEXT, period TEXT, hour INTEGER,
-  head TEXT, summary TEXT, body TEXT, hay TEXT,
+  head TEXT, summary TEXT, body TEXT, hay TEXT, text_hash TEXT,
   people TEXT, topics TEXT, things TEXT,
   access_count INTEGER DEFAULT 0, last_access TEXT,
   retired INTEGER DEFAULT 0, retired_at TEXT
@@ -1572,17 +1615,40 @@ CREATE TABLE IF NOT EXISTS edges(a TEXT, b TEXT, w INTEGER, type TEXT, PRIMARY K
 """
 
 
+def _is_meta_file(name):
+    """是不是插件自己的元文件（审计报告/水位/排除清单/索引/备份/视图），这些绝不能当记忆索引。"""
+    n = (name or "").lower()
+    if n.startswith("审计报告_"):
+        return True
+    if n in ("llm_organize_state.txt", "compacted_sources.txt", "index.json", "index_manifest.json"):
+        return True
+    if n.startswith("index.json.") or n.startswith("index_manifest"):
+        return True
+    if n.startswith("memory.db") or ".swap-" in n:
+        return True
+    if n.endswith(".html"):
+        return True
+    return False
+
+
 def _is_excluded(rel, ex):
-    """排除判定：支持精确路径与目录前缀（以 / 结尾）。"""
-    r = (rel or "").replace("\\", "/")
+    """排除判定：精确路径或目录前缀（以 / 结尾），且在任意层级生效。
+
+    例：填 "L1/" 时，L1/x.txt、facts/L1/x.txt、Memory/L1/x.txt 都会被排除——
+    否则副记忆根（facts/、Memory/）下的同名目录永远排不掉。"""
+    r = (rel or "").replace("\\", "/").strip("/")
     if not r:
         return False
+    hay = "/" + r + "/"
     for e in (ex or []):
-        e2 = str(e).replace("\\", "/")
+        e2 = str(e).replace("\\", "/").strip("/")
+        if not e2:
+            continue
         if e2.endswith("/"):
-            if r.startswith(e2):
+            e2 = e2.strip("/") + "/"
+            if hay.startswith("/" + e2) or ("/" + e2) in hay:
                 return True
-        elif r == e2:
+        elif "/" + e2 + "/" in hay:
             return True
     return False
 
@@ -1598,6 +1664,14 @@ def _db_open(db_path):
         try:
             c.execute("ALTER TABLE edges ADD COLUMN type TEXT")
             upgraded = True
+        except Exception:
+            pass
+        try:
+            c.execute("ALTER TABLE entries ADD COLUMN text_hash TEXT")
+        except Exception:
+            pass
+        try:
+            c.execute("CREATE INDEX IF NOT EXISTS ix_entries_hash ON entries(text_hash)")
         except Exception:
             pass
         c.commit()
@@ -1621,6 +1695,14 @@ def _db_for(outpath):
         return None
     if _DB["ok"] and _DB["path"] == dbp and _DB["conn"] is not None:
         return _DB["conn"]
+    # ★换库（多角色切换）先把旧连接关掉：否则句柄泄漏、文件被锁住删不掉
+    cn = _DB.get("conn")
+    if cn is not None:
+        try:
+            cn.close()
+        except Exception:
+            pass
+        _DB.update({"ok": False, "path": "", "conn": None})
     return _db_open(dbp)
 
 
@@ -1640,11 +1722,18 @@ def _entry_row(e, hay=None):
     if hay is None:
         hay = " ".join([str(e.get("head") or ""), str(e.get("summary") or ""),
                         str(e.get("text") or ""), tags]).lower()
+    th = e.get("_hash")
+    if not th:
+        try:
+            norm = re.sub(r"\s+", "", str(e.get("text") or ""))
+            th = hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16]
+        except Exception:
+            th = ""
     return (
         e.get("id") or "", e.get("anchor") or "", e.get("source") or "",
         e.get("time") or "", e.get("date") or "", e.get("period") or "",
         e.get("hour"), (e.get("head") or "")[:60], e.get("summary") or "",
-        e.get("text") or "", hay,
+        e.get("text") or "", hay, th,
         "|".join(e.get("people") or []), "|".join(e.get("topics") or []),
         "|".join(e.get("things") or []),
         int(e.get("access_count") or 0), e.get("last_access") or "",
@@ -1655,13 +1744,30 @@ def _entry_row(e, hay=None):
 def _db_upsert(c, e):
     try:
         c.execute(
-            "INSERT OR REPLACE INTO entries(id,anchor,source,time,date,period,hour,head,summary,body,hay,"
+            "INSERT OR REPLACE INTO entries(id,anchor,source,time,date,period,hour,head,summary,body,hay,text_hash,"
             "people,topics,things,access_count,last_access,retired,retired_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             _entry_row(e))
         return True
     except Exception:
         return False
+
+
+def _db_backfill_hash(c):
+    """旧库升级：给没有 text_hash 的条目补上（去重上限依赖它）。"""
+    try:
+        rows = c.execute("SELECT id, body FROM entries WHERE text_hash IS NULL OR text_hash=''").fetchall()
+        if not rows:
+            return 0
+        upd = []
+        for r in rows:
+            norm = re.sub(r"\s+", "", r["body"] or "")
+            upd.append((hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16], r["id"]))
+        c.executemany("UPDATE entries SET text_hash=? WHERE id=?", upd)
+        c.commit()
+        return len(upd)
+    except Exception:
+        return 0
 
 
 def _db_import_json(c, json_path):
@@ -1760,6 +1866,13 @@ def _db_rebuild_links(c):
 def _db_ready(req):
     """取连接；库为空而旧 index.json 在就先迁移（兼容只给 index 的旧调用）。"""
     idx = req.get("index") or ""
+    # ★把索引路径同步到当前库：否则图谱/迁移等内部 helper 会按旧路径开库，
+    #   顺手把当前连接关掉（Cannot operate on a closed database）。
+    try:
+        if idx:
+            _set_index(idx)
+    except Exception:
+        pass
     c = _db_for(idx)
     if c is None:
         return None
@@ -1772,17 +1885,34 @@ def _db_ready(req):
 
 
 def db_build(memdir, outpath=None, extra_dirs=None, exclude=None):
-    """增量建库：只重扫 mtime 变过的文件；返回条目总数。"""
+    """增量建库：只重扫 mtime 变过的文件；返回条目总数。
+    extra_dirs 由插件传入并限定在角色目录内；每个附加来源使用 facts/ 前缀避免路径碰撞。
+    """
     c = _db_for(outpath)
     if c is None:
         return None
     _db_import_json(c, outpath)
+    _db_backfill_hash(c)
+    if not memdir or not os.path.isdir(memdir):
+        # 目录不存在（配置错/盘没挂）时不要当成"记忆全没了"去清库
+        return c.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
     skip_dirs = {"settled", "backup", "备份", "archive", "MemoryFacts"}
     ex = set(str(x).replace("\\", "/") for x in (exclude or []))
     jobs = [(memdir, "")]
+    used_prefix = {""}
     for d in (extra_dirs or []):
         if d and os.path.isdir(d):
-            jobs.append((d, "facts/"))
+            # ★只有 MemoryFacts 才叫 facts/；其它记忆根用目录名当前缀。
+            #   否则副记忆根会被误当成"我们自己的事实层"，压缩逻辑永远跳过它们。
+            base_name = os.path.basename(os.path.normpath(d))
+            pref = "facts/" if base_name.lower() == "memoryfacts" else base_name + "/"
+            if pref in used_prefix:
+                i = 2
+                while "%s%d/" % (base_name, i) in used_prefix:
+                    i += 1
+                pref = "%s%d/" % (base_name, i)
+            used_prefix.add(pref)
+            jobs.append((d, pref))
     seen = set()
     changed = False
     for base, prefix in jobs:
@@ -1791,9 +1921,12 @@ def db_build(memdir, outpath=None, extra_dirs=None, exclude=None):
             for fn in files:
                 if not fn.lower().endswith((".md", ".txt")) or ".bak" in fn.lower():
                     continue
+                if _is_meta_file(fn):
+                    continue        # 自己的审计报告/水位/索引等，不是记忆
                 fpath = os.path.join(root, fn)
-                rel = prefix + os.path.relpath(fpath, base).replace("\\", "/")
-                if prefix == "" and _is_excluded(rel, ex):
+                inner = os.path.relpath(fpath, base).replace("\\", "/")
+                rel = prefix + inner
+                if _is_excluded(inner, ex) or _is_excluded(rel, ex):
                     continue
                 seen.add(rel)
                 try:
@@ -1812,6 +1945,14 @@ def db_build(memdir, outpath=None, extra_dirs=None, exclude=None):
                 for i, (head, body) in enumerate(_split_blocks(text)):
                     if len(body.strip()) < 12:
                         continue
+                    # ★同一条内容常被写进几十上百天的日记：超过上限只留前几份，
+                    #   否则索引会被复制品淹没（实测 813 份同句、重复组 1.3 万）
+                    _norm = re.sub(r"\s+", "", body.strip())
+                    _th = hashlib.sha1(_norm.encode("utf-8")).hexdigest()[:16]
+                    _cap = int(_CFG.get("dup_cap", 3) or 0)
+                    if _cap > 0:
+                        if c.execute("SELECT COUNT(*) FROM entries WHERE text_hash=?", (_th,)).fetchone()[0] >= _cap:
+                            continue
                     hh = _extract_hour(body)
                     ent = {
                         "id": "%s#%d" % (os.path.splitext(rel)[0], i),
@@ -1819,6 +1960,7 @@ def db_build(memdir, outpath=None, extra_dirs=None, exclude=None):
                         "source": rel, "time": t["time"], "date": t["date"], "period": t["period"],
                         "hour": hh if hh is not None else t["hour"],
                         "head": head[:60], "summary": _first_sent(body), "text": body.strip(),
+                        "_hash": _th,
                     }
                     tags = _tag(body)
                     ent["people"] = tags.get("people") or []
@@ -1827,11 +1969,17 @@ def db_build(memdir, outpath=None, extra_dirs=None, exclude=None):
                     _db_upsert(c, ent)
                 c.execute("INSERT OR REPLACE INTO files(path,mtime) VALUES(?,?)", (rel, mt))
                 changed = True
-    # 文件已消失：清掉它的条目
+    # 清理：凡不在本次扫描集合里的来源都清掉。
+    # ★不能只遍历 files 表：从旧 index.json 迁移进来的条目没有 files 行，
+    #   被排除/已删除的来源会一直留在库里（排除形同虚设）。
+    for r in c.execute("SELECT DISTINCT source FROM entries").fetchall():
+        src0 = r["source"] or ""
+        if src0 and src0 not in seen:
+            c.execute("DELETE FROM entries WHERE source=?", (src0,))
+            changed = True
     for r in c.execute("SELECT path FROM files").fetchall():
         p = r["path"]
         if p not in seen:
-            c.execute("DELETE FROM entries WHERE source=?", (p,))
             c.execute("DELETE FROM files WHERE path=?", (p,))
             changed = True
     if changed:
@@ -1841,6 +1989,21 @@ def db_build(memdir, outpath=None, extra_dirs=None, exclude=None):
         except Exception:
             pass
         c.commit()
+        # ★内容变了：所有内存缓存都得失效，否则召回会用旧向量、旧索引、旧图
+        try:
+            _VEC_CACHE.clear()
+        except Exception:
+            pass
+        _IDX["data"] = None
+        _IDX["vocab"] = None
+        _IDX["df"] = None
+        _GRAPH["built"] = False
+        _GRAPH["nodes"] = {}
+        _GRAPH["edges"] = {}
+    # ★记下当前库对应的索引路径：否则后续 _load_index() 会按旧路径去开库，
+    #   把当前连接关掉（直调 db_build 时踩过：Cannot operate on a closed database）
+    if outpath:
+        _set_index(outpath)
     n = c.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
     return n
 
@@ -1906,26 +2069,15 @@ def _db_boost(entry):
 
 
 def _db_vec_get(c, eid):
-    k = "v:" + str(eid)
-    v = _VEC_CACHE.get(k)
-    if v is not None:
-        return v
-    try:
-        row = c.execute("SELECT data FROM vec WHERE id=?", (eid,)).fetchone()
-        if row and row["data"]:
-            arr = struct.unpack("<%df" % (len(row["data"]) // 4), row["data"])
-            v = list(arr)
-            _VEC_CACHE[k] = v
-            return v
-    except Exception:
-        pass
-    return None
+    """向量只缓存在进程内：落库会让 5 万条 × 2KB 膨胀 100MB+，而重算是毫秒级（批量）。"""
+    return _VEC_CACHE.get("v:" + str(eid))
 
 
 def _db_vec_put(c, eid, vec):
     try:
         if vec:
             _VEC_CACHE["v:" + str(eid)] = vec
+            return
             c.execute("INSERT OR REPLACE INTO vec(id,data) VALUES(?,?)",
                       (eid, struct.pack("<%df" % len(vec), *vec)))
     except Exception:
@@ -1967,11 +2119,24 @@ def db_recall(req):
     like = " OR ".join(["hay LIKE ?"] * len(keys))
     sql = "SELECT * FROM entries WHERE " + " AND ".join(where) + " AND (" + like + ") ORDER BY time DESC LIMIT 400"
     rows = [_row_entry(c, r) for r in c.execute(sql, args + ["%" + t.lower() + "%" for t in keys])]
+    score_terms = terms
+    if not rows and req.get("use_graph", True):
+        # ★图谱兜底：关键词一个都没命中时，顺关系链捞（旧 JSON 路径有，DB 版不能丢）
+        try:
+            gexp = graph_expand(q, terms) or []
+        except Exception:
+            gexp = []
+        keys2 = sorted({str(t) for t in gexp if str(t).strip()}, key=len, reverse=True)[:5]
+        if keys2:
+            like2 = " OR ".join(["hay LIKE ?"] * len(keys2))
+            sql2 = "SELECT * FROM entries WHERE " + " AND ".join(where) + " AND (" + like2 + ") ORDER BY time DESC LIMIT 200"
+            rows = [_row_entry(c, r) for r in c.execute(sql2, args + ["%" + t.lower() + "%" for t in keys2])]
+            score_terms = list(dict.fromkeys(list(terms) + [t.lower() for t in keys2]))
     if not rows:
         return {"bookmarks": "", "count": 0}
     scored = []
     for e in rows:
-        w, hit = _db_score(e, terms)
+        w, hit = _db_score(e, score_terms)
         if w > 0:
             scored.append((w, hit, e.get("time") or "", e))
     if not scored:
@@ -1980,16 +2145,29 @@ def db_recall(req):
     kw_rank = {id(x[3]): i + 1 for i, x in enumerate(scored)}
 
     fused = None
-    qv = _embed([q]) if _MODEL["ready"] else None
+    qv = _embed([q]) if (_MODEL["ready"] and _MODEL.get("warmed")) else None
     if qv:
         cand = scored[:80]
-        sims = []
+        # ★批量编码：逐条 _embed 在 80 个候选时要 15 秒+（首次召回必超时），
+        #   一次 batch 提交只要零点几秒
+        vmap = {}
+        need = []
         for _, _, _, e in cand:
             v = _db_vec_get(c, e.get("id"))
-            if v is None:
-                vs = _embed([(e.get("summary") or "") + " " + (e.get("text") or "")[:300]]) or []
-                v = vs[0] if vs else None
-                _db_vec_put(c, e.get("id"), v)
+            if v is not None:
+                vmap[e.get("id")] = v
+            else:
+                need.append(e)
+        if need:
+            texts = [((x.get("summary") or "") + " " + (x.get("text") or "")[:300]) for x in need]
+            batch = _embed(texts) or []
+            for x, v in zip(need, batch):
+                if v:
+                    vmap[x.get("id")] = v
+                    _db_vec_put(c, x.get("id"), v)
+        sims = []
+        for _, _, _, e in cand:
+            v = vmap.get(e.get("id"))
             if v:
                 sims.append((_cos(qv[0], v), e))
         if sims:
@@ -2012,21 +2190,49 @@ def db_recall(req):
     cutoff = top * 0.45
     out = []
     today = datetime.date.today().isoformat()
+    seen_sources = {}   # ★必须是 dict：下面用 .get(source, 0) 计数（曾误写成 set()，导致召回必抛 AttributeError）
+    seen_dates = {}
+    seen_text = set()   # 同一条内容被复制到多天时，只出一条
     for score, _, _, e in final:
         if score < cutoff:
             break
+        source = e.get("source") or ""
+        date = e.get("date") or ""
+        # 多样性：同一出处最多两条、同一天最多三条，避免连续切块淹没真正不同的记忆。
+        if seen_sources.get(source, 0) >= 2 or seen_dates.get(date, 0) >= 3:
+            continue
+        _tkey = re.sub(r"\s+", "", e.get("text") or e.get("summary") or "")
+        if _tkey and _tkey in seen_text:
+            continue
+        if _tkey:
+            seen_text.add(_tkey)
         try:
             c.execute("UPDATE entries SET access_count=access_count+1, last_access=? WHERE id=?", (today, e.get("id")))
         except Exception:
             pass
         out.append(e)
+        seen_sources[source] = seen_sources.get(source, 0) + 1
+        seen_dates[date] = seen_dates.get(date, 0) + 1
         if len(out) >= k:
             break
     try:
         c.commit()
     except Exception:
         pass
-    return {"bookmarks": to_bookmarks(out), "count": len(out)}
+    return {"bookmarks": to_bookmarks(out), "count": len(out), "debug": {
+        "query": q, "candidates": len(scored), "semantic": bool(qv), "returned": len(out),
+        "cutoff": cutoff, "skipped_recent": int(req.get("skip_recent_days") or 0)
+    }}
+
+
+def db_debug(req):
+    result = db_recall(dict(req, top_k=max(1, min(20, int(req.get("top_k") or 5)))))
+    if result is None: return None
+    d = result.get("debug") or {}
+    text = "查询：%s；候选：%s；模式：%s；最终返回：%s；阈值：%.4f；最近跳过：%s 天" % (
+        d.get("query", ""), d.get("candidates", 0), "关键词+语义" if d.get("semantic") else "关键词/图谱",
+        d.get("returned", 0), float(d.get("cutoff", 0)), d.get("skipped_recent", 0))
+    return {"text": text, "debug": d, "bookmarks": result.get("bookmarks", "")}
 
 
 def db_browse(req):
@@ -2115,6 +2321,19 @@ def db_load_all(outpath):
         return None
 
 
+def db_close_op(req):
+    """关闭当前数据库连接但不删除文件，供安全换库时释放句柄。"""
+    try:
+        cn = _DB.get("conn")
+        if cn is not None:
+            try: cn.close()
+            except Exception: pass
+        _DB.update({"ok": False, "path": "", "conn": None})
+        return {"text": "数据库连接已关闭"}
+    except Exception as e:
+        return {"text": "关闭数据库连接失败：%s" % e}
+
+
 def db_reset_op(req):
     """清空索引库：关连接 → 删 memory.db（官方文件与事实卡都不动）。"""
     idx = req.get("index") or ""
@@ -2129,6 +2348,17 @@ def db_reset_op(req):
         _DB.update({"ok": False, "path": "", "conn": None})
         if dbp and os.path.isfile(dbp):
             os.remove(dbp)
+        # ★清库也要清缓存，否则 reset 后仍可能从 _IDX/_GRAPH 读到旧数据
+        try:
+            _VEC_CACHE.clear()
+        except Exception:
+            pass
+        _IDX["data"] = None
+        _IDX["vocab"] = None
+        _IDX["df"] = None
+        _GRAPH["built"] = False
+        _GRAPH["nodes"] = {}
+        _GRAPH["edges"] = {}
         return {"count": 0, "text": "索引库已清空（下次 build 会重建）"}
     except Exception as e:
         return {"count": 0, "text": "清空失败：%s" % e}
@@ -2148,10 +2378,12 @@ def db_build_op(req):
 _DB_OPS = {
     "build": db_build_op,
     "recall": db_recall,
+    "debug": db_debug,
     "browse": db_browse,
     "stats": db_stats,
     "links": db_links,
     "reset": db_reset_op,
+    "close": db_close_op,
 }
 
 def main():
@@ -2194,18 +2426,27 @@ def main():
             if fn == "ping":
                 reply({"id": rid, "ok": True, "device": _MODEL["device"], "dim": 512})
             elif fn == "warm":
-                # 预热：后台把索引读进来并建好词表/DF，真查询时就是热的（大库首次冷读会超 200ms 窗口）
+                # 预热：后台把模型/CUDA 弄热。★DB 模式不要再把 5 万条载进内存——
+                #   召回走 SQL，用不到全量；载进来只会白吃几十上百 MB。
                 _set_index(req.get("index"))
-                _load_index()
-                _vocab()
-                _df()
+                _wc = _db_for(req.get("index"))
+                if _wc is None:
+                    _load_index()
+                    _vocab()
+                    _df()
                 # 再吃掉模型/CUDA 的"首次编码"开销：空转一次 embed，真查询就不带这笔了
                 if _MODEL.get("ready"):
                     try:
-                        _embed(["预热"])
+                        _vc = _embed(["预热"])
+                        if _vc:
+                            _MODEL["warmed"] = True
                     except Exception:
                         pass
-                reply({"id": rid, "ok": True, "count": len(_IDX["data"] or [])})
+                try:
+                    _wn = _wc.execute("SELECT COUNT(*) FROM entries").fetchone()[0] if _wc is not None else len(_IDX["data"] or [])
+                except Exception:
+                    _wn = 0
+                reply({"id": rid, "ok": True, "count": _wn})
             elif fn == "embed":
                 texts = req.get("texts") or []
                 vecs = _embed(texts) or []
