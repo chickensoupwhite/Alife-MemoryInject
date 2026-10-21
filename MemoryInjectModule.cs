@@ -84,23 +84,48 @@ public class MemoryInjectModule(
     // ===== 生命周期 =====
 
     DateTime lastMaintain = DateTime.MinValue;
-    DateTime lastLlmOrganize = DateTime.MinValue;   // 上次模型整理时间（提炼事实卡）
+    DateTime lastLlmOrganize = DateTime.MinValue;   // 上次整理时间；启动冷却由 startedAt/StartupDelay 单独控制
+    DateTime startedAt = DateTime.Now;
+    bool llmStartupLogged;
     DateTime lastCompactOk = DateTime.MinValue;     // 上次压缩"健康"完成（扫到清单且没积压/有产出）
     DateTime lastCompact = DateTime.MinValue;        // 上次自动压缩（流水 -> 事实卡）
     DateTime lastAudit = DateTime.MinValue;          // 上次事实审计
     volatile bool compacting;                        // 压缩/审计互斥，避免并发重复干活
     volatile bool auditing;
+    volatile bool organizing;                      // 手动/自动整理互斥，避免同一批重复喂模型
     readonly SemaphoreSlim factLock = new(1, 1);      // 事实卡写入串行化（整理与压缩会并发）
     string llmStatePath = "";                        // 记录"已整理到哪个文件/时间"的水位
+
+    bool migrationsApplied;
+
+    /// <summary>配置可能晚于 OnAwake 注入：首次拿到 Configuration 时再跑迁移（幂等）。</summary>
+    void EnsureMigrations()
+    {
+        if (migrationsApplied || Configuration == null) return;
+        migrationsApplied = true;
+        ApplyDefaultMigrations();
+    }
 
     // 升级只迁移仍处于旧默认值的配置，保留用户自定义的排除规则。
     void ApplyDefaultMigrations()
     {
-        if (Configuration == null || Configuration.DefaultsMigrationVersion >= 1) return;
-        if (string.IsNullOrWhiteSpace(Configuration.ExcludeSources))
-            Configuration.ExcludeSources = "L1/";
-        Configuration.DefaultsMigrationVersion = 1;
-        logger.LogInformation("记忆书签：已应用默认规则迁移 v1（仅在原排除规则为空时加入 L1/；用户自定义规则保留）");
+        if (Configuration == null) return;
+        int ver = Configuration.DefaultsMigrationVersion;
+        if (ver < 1)
+        {
+            if (string.IsNullOrWhiteSpace(Configuration.ExcludeSources))
+                Configuration.ExcludeSources = "L1/";
+            Configuration.DefaultsMigrationVersion = 1;
+            ver = 1;
+            logger.LogInformation("记忆书签：已应用默认规则迁移 v1（原排除规则为空时加入 L1/；用户自定义规则保留）");
+        }
+        if (ver < 2)
+        {
+            // v2（vnext）：语义检索默认关闭——旧配置里可能存着 true，这里统一关一次，避免召回被弱相关结果污染。
+            Configuration.UseSemantic = false;
+            Configuration.DefaultsMigrationVersion = 2;
+            logger.LogInformation("记忆书签：已应用默认规则迁移 v2（语义召回默认关闭；需要时可在配置里重新打开）");
+        }
     }
 
     // 判断目录里有没有记忆文件（.md/.txt，递归；跳过 settled/backup/.bak）
@@ -162,7 +187,7 @@ public class MemoryInjectModule(
         try
         {
             roleRoot = Path.Combine(AlifePath.StorageFolderPath, Character.StorageKey);
-            ApplyDefaultMigrations();
+            EnsureMigrations();
             string sub = (Configuration?.MemorySubPath ?? "Storage/Memory")
                 .Replace('/', Path.DirectorySeparatorChar)
                 .Replace('\\', Path.DirectorySeparatorChar);
@@ -221,7 +246,8 @@ public class MemoryInjectModule(
                 Description = "记忆检索工具：翻自己落盘的旧账。想确认往事、查来龙去脉、按时间找、盘点欠账时，**只能**用这里的工具，" +
                               "禁止用 <Python>、读文件、扫目录、sqlite3 去查记忆（既慢又容易读到过期数据）。" +
                               "memrecall 按人事查书签；memwhen 按时间翻；memfetch 取原文；memprofile 聚画像；memloops 钓欠账；" +
-                              "memstatus 看索引；memlinks 顺关系；memdebug 解释召回；memcompact 压流水；memaudit 审矛盾。",
+                              "memstatus 看索引；memlinks 顺关系；memdebug 解释召回；memcompact 压流水；memaudit 审矛盾；" +
+                              "memorganize 空闲时小批整理（系统报点/没人说话时，可主动整理一小批未整理的流水）。",
                 Explanation =
                     "这些函数：检索类是只读的；压缩/审计只写事实卡与报告，不动原文。" +
                     "★铁律：查记忆只用下面这些工具；禁止用 <Python>、glob、读文件、`sqlite3` 去翻记忆目录或索引库——" +
@@ -233,6 +259,7 @@ public class MemoryInjectModule(
                     "<memloops keyword=\"可选\" limit=\"15\"/> 扫牵挂与欠账；" +
                     "<memstatus/> 看索引多少条、覆盖到哪天；" +
                     "<memcompact/> 手动压一次流水；" +
+                    "<memorganize max_files=\"5\"/> 手动整理一小批流水（别超 20，免得占满上下文；系统报点、没人说话的闲时可主动调它，一次一两段即可）；" +
                     "<memaudit/> 手动审一次事实卡；" +
                     "<memlinks query=\"俾斯麦\"/> 看某个词/人/物常和什么一起出现。",
             };
@@ -256,7 +283,7 @@ public class MemoryInjectModule(
             {
                 try
                 {
-                    bool ok = await sidecar.StartAsync(scriptPath, Configuration.PythonExe).ConfigureAwait(false);
+                    bool ok = await sidecar.StartAsync(scriptPath, Configuration.PythonExe, loadModel: Configuration.UseSemantic).ConfigureAwait(false);
                     logger.LogInformation("记忆回忆提示：向量侧车 {Ok}，{Status}", ok, sidecar.Status);
                     if (ok)
                     {
@@ -270,7 +297,10 @@ public class MemoryInjectModule(
                             warmDone = true;
                         }
                         catch { }
-                        await ComputeVectorsAsync().ConfigureAwait(false);
+                        // ★只有开启语义才需要本地片段的向量；关着还算会导致侧车惰性加载模型、
+                        //   白编码几千条片段（启动慢 + 吃显存），而且这些向量根本不会被用到。
+                        if (Configuration.UseSemantic)
+                            await ComputeVectorsAsync().ConfigureAwait(false);
                     }
                 }
                 catch (Exception e)
@@ -307,10 +337,22 @@ public class MemoryInjectModule(
                 // 模型整理：新落盘的流水交给模型提炼成事实卡（默认两小时一次，精度比机械切块高）
                 try
                 {
-                    if ((DateTime.Now - lastLlmOrganize).TotalMinutes >= Math.Max(5, Configuration.LlmOrganizeMinutes))
+                    int startupDelay = Math.Max(0, Configuration?.LlmOrganizeStartupDelayMinutes ?? 120);
+                    int interval = Math.Max(5, Configuration?.LlmOrganizeMinutes ?? 120);
+                    bool startupCooldownDone = (DateTime.Now - startedAt).TotalMinutes >= startupDelay;
+                    bool intervalDone = (DateTime.Now - lastLlmOrganize).TotalMinutes >= interval;
+                    if (!startupCooldownDone)
                     {
-                        await LlmOrganizeAsync().ConfigureAwait(false);
+                        if (!llmStartupLogged)
+                        {
+                            llmStartupLogged = true;
+                            logger.LogInformation("记忆书签：模型整理启动冷却中，{Minutes} 分钟后才允许自动整理", startupDelay);
+                        }
+                    }
+                    else if (intervalDone)
+                    {
                         lastLlmOrganize = DateTime.Now;
+                        await LlmOrganizeAsync().ConfigureAwait(false);
                     }
                 }
                 catch (Exception e) { logger.LogWarning(e, "记忆回忆提示：模型整理失败（不影响主流程）"); }
@@ -565,6 +607,7 @@ public class MemoryInjectModule(
     {
         try
         {
+            EnsureMigrations();
             if (Configuration == null || Configuration.Enable == false) return message;
             if (string.IsNullOrWhiteSpace(message)) return message;
             if (message.Contains(ChatBot.PokeMessageTag, StringComparison.Ordinal)) return message;
@@ -597,7 +640,7 @@ public class MemoryInjectModule(
             int waitMs = Math.Max(Configuration.SyncWaitMs, 200);
             if (warmDone == false) waitMs = Math.Max(waitMs, 5000);   // 预热未完成：给大库冷读留出时间，别当没命中
             // ★SkipRecentDays 只作用于"自动书签"（按条目日期跳过最近 N 天）；手动工具传 0，永不跳过
-            string? bookmarks = sidecar.RecallSync(stripped, waitMs, indexPath, Configuration.HalfLifeDays, Configuration.UseGraph, Configuration.SkipRecentDays, Configuration.MaxResults);
+            string? bookmarks = sidecar.RecallSync(stripped, waitMs, indexPath, Configuration.HalfLifeDays, Configuration.UseGraph, Configuration.SkipRecentDays, Configuration.MaxResults, Configuration.UseSemantic, Configuration.SemanticMinScore);
             if (string.IsNullOrWhiteSpace(bookmarks) == false)
             {
                 // ★只追加：书签拼在本轮用户消息末尾，用户原话一字不动。
@@ -678,6 +721,8 @@ public class MemoryInjectModule(
             ["top_k"] = Math.Clamp(Configuration.MaxResults, 1, 20),
             ["half_life"] = Configuration.HalfLifeDays,
             ["use_graph"] = Configuration.UseGraph,
+            ["use_semantic"] = Configuration.UseSemantic,
+            ["semantic_min_score"] = Configuration.SemanticMinScore,
         }, 8000, indexPath).ConfigureAwait(false);
         string? bm = (r != null && r.Value.TryGetProperty("bookmarks", out JsonElement bEl)) ? (bEl.GetString() ?? "") : null;
         string msg = bm == null
@@ -724,6 +769,7 @@ public class MemoryInjectModule(
                 ["keyword"] = keyword ?? "",
                 ["top_k"] = k,
                 ["use_graph"] = Configuration.UseGraph,
+                ["use_semantic"] = Configuration.UseSemantic,
             };
             string? bm = await sidecar.AskFieldAsync("bywhen", args, "bookmarks", 8000, indexPath).ConfigureAwait(false);
             return R(string.IsNullOrWhiteSpace(bm) ? $"「{time}」那段时间没翻到记忆（或者说不清是哪段）。换个说法试试，比如「上周三」「三天前」。" : bm!);
@@ -740,7 +786,9 @@ public class MemoryInjectModule(
             string? text = await sidecar.AskAsync("debug", new Dictionary<string, object?>
             {
                 ["query"] = query ?? "", ["top_k"] = top, ["skip_recent_days"] = 0,
-                ["use_graph"] = Configuration.UseGraph
+                ["use_graph"] = Configuration.UseGraph,
+                ["use_semantic"] = Configuration.UseSemantic,
+                ["semantic_min_score"] = Configuration.SemanticMinScore
             }, 8000, indexPath).ConfigureAwait(false);
             return R(string.IsNullOrWhiteSpace(text) ? "调试查询无结果（侧车可能未就绪）。" : text!);
         }
@@ -831,6 +879,27 @@ public class MemoryInjectModule(
             return R("当前有 " + n + " 个压缩候选；门槛为至少 " + Configuration.AutoCompactMinEntries + " 条且至少 " + Configuration.AutoCompactMinAgeDays + " 天。确认后再调用 memcompact。" );
         }
         catch (Exception e) { return "预览压缩失败：" + e.Message; }
+    }
+
+    /// <summary>手动整理一批记忆流水（空闲时用；批次别大，模型上下文有限）。</summary>
+    [XmlFunction(FunctionMode.OneShot, "memorganize")]
+    [Description("手动整理一小批记忆流水（从新到旧），提炼成事实卡。空闲或觉得事实卡没跟上时用。默认只整理 5 个源文件（模型上下文有限，别一次喂太多）。")]
+    public async Task<string> Organize(
+        [Description("这一批最多整理几个源文件，默认 5，最大 20（每个文件还会按字数预算截断）")] int max_files = 5)
+    {
+        try
+        {
+            if (organizing) return R("正在整理中（自动或上一次手动还没跑完），稍后再试。");
+            int cap = Math.Clamp(max_files <= 0 ? 5 : max_files, 1, 20);
+            int chars = Math.Clamp(Configuration.LlmOrganizeManualMaxChars, 2000, Configuration.LlmOrganizeMaxChars);
+            var (n, fact) = await LlmOrganizeAsync(cap, force: true, maxChars: chars).ConfigureAwait(false);
+            if (n == 0) return R("没有需要整理的流水（都已整理过，或模型/侧车没就绪）。");
+            string tail = string.IsNullOrWhiteSpace(fact)
+                ? "模型认为这批没长期价值，已推进水位。"
+                : "事实卡 -> " + Path.GetFileName(fact);
+            return R($"已整理 {n} 份流水：{tail}（批次刻意小，避免占满上下文；需要继续就再调一次）");
+        }
+        catch (Exception e) { return "整理失败：" + e.Message; }
     }
 
     /// <summary>① 手动触发一次压缩。</summary>
@@ -1075,10 +1144,19 @@ public class MemoryInjectModule(
     /// 走后台模型调用（ChatAsync，breakLast:false），不进主对话上下文。
     /// 水位记在 llm_organize_state.txt：记"已整理过的 文件|mtime"，只处理没整理过的新文件。
     /// </summary>
-    async Task LlmOrganizeAsync()
+    async Task<(int files, string fact)> LlmOrganizeAsync(int maxFiles = 0, bool force = false, int maxChars = 0)
     {
-        if (Configuration == null || Configuration.LlmOrganizeEnable == false) return;
-        if (string.IsNullOrWhiteSpace(memoryRoot) || Directory.Exists(memoryRoot) == false) return;
+        if (organizing) return (0, "");
+        organizing = true;
+        try { return await LlmOrganizeCoreAsync(maxFiles, force, maxChars).ConfigureAwait(false); }
+        finally { organizing = false; }
+    }
+
+    async Task<(int files, string fact)> LlmOrganizeCoreAsync(int maxFiles, bool force, int maxChars = 0)
+    {
+        if (Configuration == null) return (0, "");
+        if (force == false && Configuration.LlmOrganizeEnable == false) return (0, "");
+        if (string.IsNullOrWhiteSpace(memoryRoot) || Directory.Exists(memoryRoot) == false) return (0, "");
 
         // 读水位：已整理过的 文件相对路径|mtime 集合
         var done = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1139,10 +1217,10 @@ public class MemoryInjectModule(
         // ★关键顺序：先收集全部候选 → 按修改时间从新到旧排序 → 再按预算选材。
         //   旧实现边枚举边扣预算、最后才排序，枚举顺序（目录/文件名）会让老档先吃光预算，新档永远轮不到。
         var fresh = new List<(string path, string key, string text, DateTime mt)>();
-        int budget = Math.Max(2000, Configuration.LlmOrganizeMaxChars);
+        int budget = Math.Max(2000, maxChars > 0 ? maxChars : Configuration.LlmOrganizeMaxChars);
         try
         {
-            var cands = new List<(string path, string key, string rel, DateTime mt, string text)>();
+            var cands = new List<(string path, string baseKey, string rel, DateTime mt, string text, int offset)>();
             foreach (var item in EnumerateAllMemoryFiles())
             {
                 string f = item.file;
@@ -1156,38 +1234,46 @@ public class MemoryInjectModule(
                 try { mt = File.GetLastWriteTime(f); } catch { continue; }
                 string txt;
                 try { txt = File.ReadAllText(f); } catch { continue; }
-                // ★水位用内容哈希而不是 mtime：文件被 touch/复制/还原不会重喂，内容真变了才重整理
-                string key = relPath + "|" + ContentKey(txt);
-                if (done.Contains(key)) continue;
+                // ★水位 = relPath|内容哈希|已整理到第几个字符。
+                //   内容变了哈希就变，自然从头来；内容没变只推进 offset，绝不重复喂同一段。
+                //   这样既能"每批只喂很小一段"（省上下文），也不会像截断那样丢掉文件尾巴。
+                string baseKey = relPath + "|" + ContentKey(txt);
+                if (done.Contains(baseKey)) continue;                 // 旧格式：整份已处理
+                int offset = 0;
+                foreach (string k in done)
+                {
+                    if (k.StartsWith(baseKey + "|", StringComparison.OrdinalIgnoreCase) == false) continue;
+                    if (int.TryParse(k.Substring(baseKey.Length + 1), out int off2) && off2 > offset) offset = off2;
+                }
                 if (legacyDone.Contains(relPath))
                 {
                     // 旧水位：只有文件在水位写盘之后没再改过，才算"已处理"；
                     // 改过就按新内容整理，避免升级后漏掉最后一次改动。
-                    if (mt <= stateTime.AddSeconds(5)) { done.Add(key); continue; }
+                    if (mt <= stateTime.AddSeconds(5)) { done.Add(baseKey + "|" + txt.Length); continue; }
                 }
-                if (string.IsNullOrWhiteSpace(txt)) { done.Add(key); continue; }
-                cands.Add((f, key, relPath, mt, txt));
+                if (string.IsNullOrWhiteSpace(txt)) { done.Add(baseKey + "|" + txt.Length); continue; }
+                if (offset >= txt.Length) continue;
+                cands.Add((f, baseKey, relPath, mt, txt, offset));
             }
             // 新→旧：新流水优先
             cands.Sort((x, y) => y.mt.CompareTo(x.mt));
             foreach (var c in cands)
             {
                 if (budget <= 0) break;
-                string txt = c.text;
-                if (txt.Length > budget)
-                {
-                    // ★超预算截断而不是整份跳过：跳过会让超大文件永远排不上（旧代码就是截断，别退化）
-                    logger.LogWarning("记忆书签：整理截断超大文件 {f}（{n} 字 > 预算 {b}）", c.rel, txt.Length, budget);
-                    txt = txt.Substring(0, budget);
-                }
-                if (txt.Length == 0) continue;
-                fresh.Add((c.path, c.key, txt, c.mt));
-                budget -= txt.Length;
+                int take = Math.Min(c.text.Length - c.offset, budget);
+                if (take <= 0) continue;
+                string seg = c.text.Substring(c.offset, take);
+                string key = c.baseKey + "|" + (c.offset + take);
+                if (done.Contains(key)) continue;
+                int fileCap = maxFiles > 0 ? Math.Clamp(maxFiles, 1, 200) : Math.Max(1, Configuration.LlmOrganizeMaxFilesPerRun);
+                if (fresh.Count >= fileCap) break;
+                fresh.Add((c.path, key, seg, c.mt));
+                budget -= take;
             }
         }
-        catch (Exception e) { logger.LogWarning(e, "记忆书签：模型整理扫描失败"); return; }
+        catch (Exception e) { logger.LogWarning(e, "记忆书签：模型整理扫描失败"); return (0, ""); }
 
-        if (fresh.Count == 0) return;
+        if (fresh.Count == 0) return (0, "");
 
         string body = string.Join("\n\n", fresh.Select(x => "【" + Path.GetFileName(x.path) + "】\n" + x.text));
         string prompt =
@@ -1198,16 +1284,16 @@ public class MemoryInjectModule(
 
         ChatResult result;
         try { result = await chatBot.ChatAsync(prompt, breakLast: false).ConfigureAwait(false); }
-        catch (Exception e) { logger.LogWarning(e, "记忆书签：模型整理调用失败"); return; }
+        catch (Exception e) { logger.LogWarning(e, "记忆书签：模型整理调用失败"); return (0, ""); }
 
-        if (result.Exception != null) { logger.LogWarning("记忆书签：模型整理出错 {m}", result.Exception.Message); return; }
+        if (result.Exception != null) { logger.LogWarning("记忆书签：模型整理出错 {m}", result.Exception.Message); return (0, ""); }
         string cards = (result.AIMessage ?? "").Trim();
         if (string.IsNullOrWhiteSpace(cards))
         {
             // 模型认为没价值：仍记水位，免得反复重试同一个文件
             foreach (var x in fresh) done.Add(x.key);
             TrySaveState(done);
-            return;
+            return (fresh.Count, "");
         }
 
         // ③ 写入合并：不再直接 AppendAllText —— 先与已有事实合并（重复丢弃、相近合并）
@@ -1215,12 +1301,13 @@ public class MemoryInjectModule(
         if (string.IsNullOrWhiteSpace(factFile))
         {
             logger.LogWarning("记忆书签：模型整理写盘失败（水位不推进，稍后重试）");
-            return;
+            return (0, "");
         }
         logger.LogInformation("记忆书签：模型整理落盘 {n} 个文件 -> {f}（已合并去重）", fresh.Count, factFile);
 
         foreach (var x in fresh) done.Add(x.key);
         TrySaveState(done);
+        return (fresh.Count, factFile);
     }
 
     /// <summary>内容指纹（文件内容变了才变），水位用它，避免 mtime 抖动导致反复重喂。</summary>
