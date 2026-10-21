@@ -336,7 +336,7 @@ def parse_time_hint(text):
 
 
 def recall(query, top_k=5, min_ratio=0.45, date_from=None, date_to=None, period=None,
-           hour_from=None, hour_to=None, use_graph=True, skip_recent_days=0):
+           hour_from=None, hour_to=None, use_graph=True, skip_recent_days=0, use_semantic=False):
     """
     召回：输入一句中文，返回命中的记忆条目（按相关度倒序）。
     打分 = 字段权重（标签3>标题3>摘要2>正文1）× 词权重（IDF，常见词降权）。
@@ -418,7 +418,8 @@ def recall(query, top_k=5, min_ratio=0.45, date_from=None, date_to=None, period=
 
     # 语义路：向量余弦，降序 → 排名（拿不到向量就整体退回纯词频）
     # ★未预热时首次 _embed 会吃 15s CUDA 预热，别让它卡在用户查询里
-    qv = _embed([query]) if (_MODEL["ready"] and _MODEL.get("warmed")) else None
+    # ★语义开关默认关：JSON 兜底路径也必须遵守，否则 memwhen+keyword 会偷偷跑向量
+    qv = _embed([query]) if (use_semantic and _MODEL["ready"] and _MODEL.get("warmed")) else None
     fused = None
     if qv:
         # ★大库保护：关键词路已按分数降序，只对前 N 条做语义精排。
@@ -1126,11 +1127,12 @@ def bytime(date_from=None, date_to=None, period=None, hour_from=None, hour_to=No
     return data[:max(1, int(top_k or 10))]
 
 
-def bywhen(text, keyword=None, top_k=8, use_graph=True):
+def bywhen(text, keyword=None, top_k=8, use_graph=True, use_semantic=False):
     """一句中文时间词 -> 那段时间的记忆。「上周三」「三天前」「昨晚」都行；给关键词就按相关度排。"""
     df, dt, pd = parse_time_hint(text or "")
     if keyword:
-        hits = recall(keyword, top_k=top_k, date_from=df, date_to=dt, period=pd, use_graph=use_graph)
+        hits = recall(keyword, top_k=top_k, date_from=df, date_to=dt, period=pd, use_graph=use_graph,
+                      use_semantic=use_semantic)
     else:
         hits = bytime(date_from=df, date_to=dt, period=pd, top_k=top_k)
     return {
@@ -2145,7 +2147,12 @@ def db_recall(req):
     kw_rank = {id(x[3]): i + 1 for i, x in enumerate(scored)}
 
     fused = None
-    qv = _embed([q]) if (_MODEL["ready"] and _MODEL.get("warmed")) else None
+    use_semantic = bool(req.get("use_semantic", False))
+    try:
+        semantic_min_score = float(req.get("semantic_min_score", 0.58))
+    except Exception:
+        semantic_min_score = 0.58
+    qv = _embed([q]) if use_semantic and (_MODEL["ready"] and _MODEL.get("warmed")) else None
     if qv:
         cand = scored[:80]
         # ★批量编码：逐条 _embed 在 80 个候选时要 15 秒+（首次召回必超时），
@@ -2169,20 +2176,25 @@ def db_recall(req):
         for _, _, _, e in cand:
             v = vmap.get(e.get("id"))
             if v:
-                sims.append((_cos(qv[0], v), e))
+                sim = _cos(qv[0], v)
+                if sim >= semantic_min_score:
+                    sims.append((sim, e))
         if sims:
             sims.sort(key=lambda x: x[0], reverse=True)
-            sem_rank = {id(e): i + 1 for i, (_, e) in enumerate(sims)}
-            K = 60
+            sem_score = {id(e): s for s, e in sims}
+            # ★语义只能做"最多 +25%"的加权微调：
+            #   原来的 0.35 * 1/(60+rank) 是加法项，量级能压过 kw/1000，
+            #   实测开语义后"血压"前五会整体换人，等于语义在主导排序。
+            #   改成乘性提升，关键词顺序仍是主体，语义只把高相似候选往上抬一点。
             fuse = []
-            for _, _, _, e in scored:
-                rrf = 0.0
-                if id(e) in kw_rank:
-                    rrf += 1.0 / (K + kw_rank[id(e)])
-                if id(e) in sem_rank:
-                    rrf += 1.0 / (K + sem_rank[id(e)])
-                dual = (id(e) in kw_rank) and (id(e) in sem_rank)
-                fuse.append((rrf * _db_boost(e), 1 if dual else 0, e.get("time") or "", e))
+            for kw, hit, tm, e in scored:
+                score = (kw / 1000.0) * _db_boost(e)
+                sim = sem_score.get(id(e))
+                if sim is not None:
+                    span = max(1e-6, 1.0 - semantic_min_score)
+                    lift = max(0.0, min(1.0, (sim - semantic_min_score) / span))
+                    score *= (1.0 + 0.25 * lift)
+                fuse.append((score, hit, tm, e))
             fuse.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
             fused = fuse
     final = fused if fused else [(w / 1000.0 * _db_boost(e), hit, t, e) for w, hit, t, e in scored]
@@ -2393,12 +2405,16 @@ def main():
         sys.stdout.flush()
 
     # 启动先试着把模型装上（装不上也不退出，recall 还能用）
-    try:
-        _ensure_model()
-        reply({"id": 0, "fn": "ready", "ok": True, "device": _MODEL["device"], "index": _find_index()})
-    except Exception as e:
-        reply({"id": 0, "fn": "ready", "ok": True, "device": "unavailable",
-               "error": "%s: %s" % (type(e).__name__, e), "index": _find_index()})
+    # --no-model：语义关闭时不加载模型（省启动时间与显存）；真要 embed 时会惰性加载
+    if "--no-model" in sys.argv:
+        reply({"id": 0, "fn": "ready", "ok": True, "device": "disabled", "index": _find_index()})
+    else:
+        try:
+            _ensure_model()
+            reply({"id": 0, "fn": "ready", "ok": True, "device": _MODEL["device"], "index": _find_index()})
+        except Exception as e:
+            reply({"id": 0, "fn": "ready", "ok": True, "device": "unavailable",
+                   "error": "%s: %s" % (type(e).__name__, e), "index": _find_index()})
 
     # 索引缺失或为空：请 C# 侧后台触发 build（这里不擅自扫目录，路径由 C# 给）
 
@@ -2463,7 +2479,8 @@ def main():
                               period=req.get("period") or None,
                               hour_from=req.get("hour_from"), hour_to=req.get("hour_to"),
                               use_graph=bool(req.get("use_graph", True)),
-                              skip_recent_days=int(req.get("skip_recent_days") or 0))
+                              skip_recent_days=int(req.get("skip_recent_days") or 0),
+                              use_semantic=bool(req.get("use_semantic", False)))
                 reply({"id": rid, "ok": True, "bookmarks": to_bookmarks(hits), "count": len(hits)})
             elif fn == "build":
                 if req.get("block_max"):
@@ -2523,7 +2540,8 @@ def main():
             elif fn == "bywhen":
                 _set_index(req.get("index"))
                 r = bywhen(req.get("text") or "", req.get("keyword") or None,
-                           int(req.get("top_k") or 8), bool(req.get("use_graph", True)))
+                           int(req.get("top_k") or 8), bool(req.get("use_graph", True)),
+                           bool(req.get("use_semantic", False)))
                 reply({"id": rid, "ok": True, **r})
             elif fn == "compactscan":
                 _set_index(req.get("index"))
