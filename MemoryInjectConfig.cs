@@ -54,6 +54,10 @@ public class MemoryInjectConfig
     [Description("只作用于自动书签：按条目的日期跳过最近 N 天（不是文件修改时间）；手动调 memrecall/memwhen 永不跳过。0 = 不忽略。默认 1。")]
     public int SkipRecentDays { get; set; } = 1;
 
+    [DisplayName("排除的系统短语")]
+    [Description("消息里含这些短语的圆括号段（如\"回复时请保持发言简洁…\"）整段剔除，不参与检索；裸出现的短语也一并抹掉。逗号分隔。")]
+    public string QueryExcludePhrases { get; set; } = "回复时请保持发言简洁,注意遵守对话输出规范,对话输出规范,对话输出示例,通用工具要求,报点提示,禁用旁白,积极使用系统提供的图片,keep your response concise,keep responses concise,do not use emoji,follow the output format";
+
     [DisplayName("最短检索字符数")]
     [Description("消息去掉系统标签后不足这么多字就不检索（如「行」「嗯」这类应答）。建议 3。")]
     public int MinQueryChars { get; set; } = 3;
@@ -147,7 +151,7 @@ public class MemoryInjectConfig
 
     [DisplayName("工具结果回显到聊天框")]
     [Description("打开后，工具查到的内容也会 Poke 进聊天框（截断到 400 字）。模型同轮已能拿到返回值，这主要是给人看的。建议开。")]
-    public bool EchoToolResult { get; set; } = true;
+    public bool EchoToolResult { get; set; } = false;
 
     [DisplayName("事实合并阈值")]
     [Description("新事实与已有事实（同主体同类别）相似度达到这里就合并，低于则新增。0.5 左右比较合适。")]
