@@ -13,6 +13,9 @@ using Alife.Foundation;
 using Alife.Framework;
 using Alife.Function.FunctionCaller;
 using Microsoft.Extensions.Logging;
+using Microsoft.SemanticKernel;
+using Microsoft.SemanticKernel.Agents;
+using Microsoft.SemanticKernel.ChatCompletion;
 
 namespace Mao.MemoryRecall;
 
@@ -231,6 +234,8 @@ public class MemoryInjectModule(
 
         // 清掉历史换库留下的 swap / 旧备份（每份几十~几百 MB，不清会把盘吃满）
         try { PruneBackups(); } catch { }
+        // 一次性迁移：清掉事实卡里的 XML/代码垃圾（自动，带备份；历史污染走手动 memcleanhistory）
+        try { MigrateFactCards(); } catch { }
 
         // 本角色有没有记忆文件：没有就别启侧车、别检索（否则会串到别人的索引）
         try { hasMemory = memoryRoots.Any(x => HasMemoryFiles(x.root)); } catch { hasMemory = false; }
@@ -246,7 +251,7 @@ public class MemoryInjectModule(
                 Description = "记忆检索工具：翻自己落盘的旧账。想确认往事、查来龙去脉、按时间找、盘点欠账时，**只能**用这里的工具，" +
                               "禁止用 <Python>、读文件、扫目录、sqlite3 去查记忆（既慢又容易读到过期数据）。" +
                               "memrecall 按人事查书签；memwhen 按时间翻；memfetch 取原文；memprofile 聚画像；memloops 钓欠账；" +
-                              "memstatus 看索引；memlinks 顺关系；memdebug 解释召回；memcompact 压流水；memaudit 审矛盾；" +
+                              "memstatus 看索引；memlinks 顺关系；memdebug 解释召回；memcompact 压流水；memaudit 审矛盾；memcleanhistory 清历史合成消息；" +
                               "memorganize 空闲时小批整理（系统报点/没人说话时，可主动整理一小批未整理的流水）。",
                 Explanation =
                     "这些函数：检索类是只读的；压缩/审计只写事实卡与报告，不动原文。" +
@@ -603,6 +608,187 @@ public class MemoryInjectModule(
 
     // ===== 主流程 =====
 
+    /// <summary>
+    /// 剔除系统尾巴与系统标签（只作用于召回查询，不改动原消息/历史）。
+    /// 全面策略：
+    ///  1) 行首元数据（当前时间/消息来源/系统时间/来源/角色/场景）连同 [标签] 一起去掉；
+    ///  2) [系统]/【系统提示】这类独立标签去掉；
+    ///  3) 整行都是括号的段落：含短语，或系统标记词 ≥2 → 整行删；
+    ///  4) 行内括号段：含短语，或系统标记词 ≥3 → 删（"（笑）"这类保留）；
+    ///  5) 裸短语（≥4 字）抹掉；
+    ///  6) 去零宽字符、折叠空白、清掉纯标点行。
+    /// </summary>
+    string StripExcludedPhrases(string message)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(message)) return message;
+            string raw = Configuration?.QueryExcludePhrases;
+            List<string> phrases = string.IsNullOrWhiteSpace(raw)
+                ? new List<string>()
+                : raw.Split(new[] { ',', '，', ';', '；' }, StringSplitOptions.RemoveEmptyEntries)
+                     .Select(x => x.Trim()).Where(x => x.Length >= 2).ToList();
+            string[] markers = { "请", "注意", "保持", "不要", "禁止", "使用", "遵守", "规范", "示例", "旁白", "表情", "emoji", "报点", "系统", "输出", "格式" };
+
+            string result = message;
+            // 0) 零宽/不可见字符
+            result = Regex.Replace(result, @"[\u200B-\u200D\uFEFF]", "");
+            // 0b) HTML 注释（系统提示常以注释形式注入）
+            result = Regex.Replace(result, @"<!--[\s\S]*?-->", " ");
+            // 1) 行首元数据标签（可带 [标签]）
+            result = Regex.Replace(result, @"(?im)^[ \t]*(?:当前时间|消息来源|系统时间|来源|角色|场景)[ \t]*[:：][ \t]*(?:\[[^\]]*\])?[ \t]*", "");
+            // 2) [系统]/【系统提示】这类独立标签
+            result = Regex.Replace(result, @"[\[【][ \t]*(?:系统|system)(?:提示|消息|通知)?[ \t]*[\]】]", " ");
+
+            bool HasPhrase(string text)
+            {
+                foreach (string p in phrases) if (text.Contains(p, StringComparison.OrdinalIgnoreCase)) return true;
+                return false;
+            }
+            int CountMarkers(string text)
+            {
+                int n = 0;
+                foreach (string mk in markers) if (text.Contains(mk, StringComparison.OrdinalIgnoreCase)) n++;
+                return n;
+            }
+            string Normalize(string text) => Regex.Replace(text, @"[【】「」《》〈〉\[\]<>]", "");
+
+            // 3) 整行括号段：含短语，或系统标记词 ≥2 → 删整行
+            result = Regex.Replace(result, @"(?m)^[ \t]*[（(][^\n]*[）)][ \t]*$", mm =>
+            {
+                string norm = Normalize(mm.Value);
+                return (HasPhrase(norm) || CountMarkers(norm) >= 2) ? " " : mm.Value;
+            });
+            // 4) 行内括号段：含短语，或系统标记 ≥3 → 删（保留"（笑）""（请帮我查一下）"这类用户补充）
+            result = Regex.Replace(result, @"[（(][^（()）\n]*[)）]", mm =>
+            {
+                string norm = Normalize(mm.Value);
+                return (HasPhrase(norm) || CountMarkers(norm) >= 3) ? " " : mm.Value;
+            });
+            // 5) 去掉装饰括号后再匹配裸短语：这样"注意遵守【对话输出规范】"也能整段命中
+            result = Regex.Replace(result, @"[【】「」《》〈〉\[\]<>]", "");
+            foreach (string p in phrases.Where(x => x.Length >= 4))
+                result = result.Replace(p, " ", StringComparison.OrdinalIgnoreCase);
+            // 6) 收尾：清纯标点行、折叠所有空白（含换行）
+            result = Regex.Replace(result, @"(?m)^[ \t]*[，,。.；;：:、\-—]+[ \t]*$", "");
+            result = Regex.Replace(result, @"\s+", " ");
+            return result.Trim();
+        }
+        catch
+        {
+            return message;   // 任何异常都放过原消息，绝不因为过滤把话弄丢
+        }
+    }
+
+
+    /// <summary>明显不是事实的行：XML 注释/标签、代码围栏、Python 代码。</summary>
+    static bool IsJunkFactLine(string t)
+    {
+        if (Regex.IsMatch(t, @"^[-*・]?\s*<!?-?-?.*-->")) return true;
+        if (Regex.IsMatch(t, @"^[-*・]?\s*</?[A-Za-z][^>]*/?>")) return true;
+        if (Regex.IsMatch(t, @"^[-*・]?\s*\x60\x60\x60")) return true;
+        if (Regex.IsMatch(t, @"^[-*・]?\s*(import |from |for |if |def |print\(|os\.|re\.|base\s*=|p\s*=|t\s*=|return |class )")) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// 4.8.6 一次性迁移：清掉所有事实卡里的 XML/注释/代码行，只删明显垃圾，散文与自由格式保留。
+    /// 每个文件先备份 .bak-migrate-4.8.6；写标记文件，只跑一次。
+    /// </summary>
+    void MigrateFactCards()
+    {
+        try
+        {
+            string marker = Path.Combine(factsRoot, ".migrated-facts-4.8.6");
+            if (File.Exists(marker)) return;
+            int files = 0, removed = 0;
+            var roots = new List<string>();
+            foreach (var item in memoryRoots) roots.Add(item.root);
+            roots.Add(factsRoot);
+            foreach (string root in roots.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                if (Directory.Exists(root) == false) continue;
+                foreach (string f in Directory.EnumerateFiles(root, "事实_*.md", SearchOption.AllDirectories))
+                {
+                    if (f.Contains(".bak", StringComparison.OrdinalIgnoreCase)) continue;
+                    try
+                    {
+                        var lines = File.ReadAllLines(f);
+                        var kept = new List<string>();
+                        int dropped = 0;
+                        bool inCode = false;
+                        foreach (string ln in lines)
+                        {
+                            string t = ln.Trim();
+                            if (t.StartsWith("\x60\x60\x60")) { inCode = !inCode; dropped++; continue; }
+                            if (inCode) { dropped++; continue; }
+                            if (t.Length > 0 && IsJunkFactLine(t)) { dropped++; continue; }
+                            kept.Add(ln);
+                        }
+                        if (dropped == 0) continue;
+                        File.Copy(f, f + ".bak-migrate-4.8.6", overwrite: true);
+                        File.WriteAllLines(f, kept);
+                        files++;
+                        removed += dropped;
+                    }
+                    catch { }
+                }
+            }
+            Directory.CreateDirectory(factsRoot);
+            File.WriteAllText(marker, DateTime.Now.ToString("o") + "\nfiles=" + files + " removed=" + removed);
+            logger.LogInformation("记忆书签：事实卡迁移完成，清理 {f} 个文件 / {n} 行垃圾", files, removed);
+        }
+        catch (Exception e) { logger.LogWarning(e, "记忆书签：事实卡迁移失败（下次启动重试）"); }
+    }
+
+    static bool IsSyntheticHistory(ChatMessageContent m)
+    {
+        string c = m?.Content ?? "";
+        return c.Contains("[消息来源(记忆整理)]", StringComparison.Ordinal)
+            || c.Contains("[消息来源(记忆压缩)]", StringComparison.Ordinal);
+    }
+
+    /// <summary>手动清理历史里由整理/压缩写入的合成提示词（默认只统计；apply=true 才删，删前备份 History.json）。</summary>
+    async Task<(int count, int chars, string backup)> CleanHistoryAsync(bool apply)
+    {
+        int count = 0, chars = 0;
+        foreach (ChatMessageContent m in ChatBot.ChatHistory)
+        {
+            if (IsSyntheticHistory(m) == false) continue;
+            count++;
+            chars += (m.Content ?? "").Length;
+        }
+        if (apply == false || count == 0) return (count, chars, "");
+
+        string backup = "";
+        try
+        {
+            string hist = Path.Combine(roleRoot, "Memory", "History.json");
+            if (File.Exists(hist))
+            {
+                backup = hist + ".bak-cleanhistory-" + DateTime.Now.ToString("yyyyMMddHHmmss");
+                File.Copy(hist, backup, true);
+            }
+        }
+        catch { }
+
+        int removed = 0;
+        await ChatBot.EditChatHistoryAsync(thread =>
+        {
+            var h = thread.ChatHistory;
+            for (int i = h.Count - 1; i >= 0; i--)
+            {
+                if (IsSyntheticHistory(h[i]) == false) continue;
+                // 先删它的配对回包（紧随其后、assistant）
+                if (i + 1 < h.Count && h[i + 1].Role == AuthorRole.Assistant) h.RemoveAt(i + 1);
+                h.RemoveAt(i);
+                removed++;
+            }
+            return Task.CompletedTask;
+        }, "记忆书签：清理历史合成消息").ConfigureAwait(false);
+        return (removed, chars, backup);
+    }
+
     string OnChatSend(string message)
     {
         try
@@ -622,6 +808,7 @@ public class MemoryInjectModule(
 
             // 先剔掉 [来源][...] 这类方括号标签，再数有效字数
             string stripped = Regex.Replace(message, @"\[[^\]]*\]", " ");
+            stripped = StripExcludedPhrases(stripped);
             string bare = new string(stripped.Where(char.IsLetterOrDigit).ToArray());
             if (bare.Length < Configuration.MinQueryChars) return message;
 
@@ -879,6 +1066,22 @@ public class MemoryInjectModule(
             return R("当前有 " + n + " 个压缩候选；门槛为至少 " + Configuration.AutoCompactMinEntries + " 条且至少 " + Configuration.AutoCompactMinAgeDays + " 天。确认后再调用 memcompact。" );
         }
         catch (Exception e) { return "预览压缩失败：" + e.Message; }
+    }
+
+    /// <summary>手动清理历史里的合成提示词（默认只统计）。</summary>
+    [XmlFunction(FunctionMode.OneShot, "memcleanhistory")]
+    [Description("清理聊天历史里由本插件整理/压缩写入的合成提示词（默认只统计不删；apply=true 才真删，删前自动备份 History.json）。")]
+    public async Task<string> CleanHistory([Description("true=真正删除；默认 false 只统计")] bool apply = false)
+    {
+        try
+        {
+            var (n, chars, bak) = await CleanHistoryAsync(apply).ConfigureAwait(false);
+            if (n == 0) return R("历史里没有本插件写入的合成消息，干净。");
+            if (apply == false)
+                return R($"历史里有 {n} 条合成消息（{chars} 字），尚未删除。确认后可调 memcleanhistory apply=true。");
+            return R($"已清理 {n} 条合成消息（{chars} 字）。" + (string.IsNullOrEmpty(bak) ? "" : "备份：" + bak));
+        }
+        catch (Exception e) { return "清理历史失败：" + e.Message; }
     }
 
     /// <summary>手动整理一批记忆流水（空闲时用；批次别大，模型上下文有限）。</summary>
@@ -1156,6 +1359,9 @@ public class MemoryInjectModule(
     {
         if (Configuration == null) return (0, "");
         if (force == false && Configuration.LlmOrganizeEnable == false) return (0, "");
+        // ★自动整理绝不在模型回合进行中插 ChatAsync：ChatAsync 会写 ChatHistory，
+        //   与 UI 渲染并发时会抛 "Collection was modified"。手动工具(force)不受此限。
+        if (force == false && functionCaller.IsIdle == false) return (0, "");
         if (string.IsNullOrWhiteSpace(memoryRoot) || Directory.Exists(memoryRoot) == false) return (0, "");
 
         // 读水位：已整理过的 文件相对路径|mtime 集合
@@ -1280,14 +1486,10 @@ public class MemoryInjectModule(
             "[消息来源(记忆整理)]下面是刚落盘的新记忆流水。请把它提炼成若干条「事实卡」，每条一行，格式：\n" +
             "- 日期 | 涉及谁 | 属哪件事 | 一句话事实\n" +
             "要求：只记事实，别抒情、别复述细节；只提炼有长期价值的信息（决定、进度、健康状况、约定、重要结论）；" +
-            "没价值的不记。直接输出卡片行，不要解释、不要寒暄。\n\n" + body;
+            "没价值的不记。只输出事实行：不要调用任何工具（Python/Expression/Speak 等），不要输出代码、XML 或解释，不要寒暄。\n\n" + body;
 
-        ChatResult result;
-        try { result = await chatBot.ChatAsync(prompt, breakLast: false).ConfigureAwait(false); }
-        catch (Exception e) { logger.LogWarning(e, "记忆书签：模型整理调用失败"); return (0, ""); }
-
-        if (result.Exception != null) { logger.LogWarning("记忆书签：模型整理出错 {m}", result.Exception.Message); return (0, ""); }
-        string cards = (result.AIMessage ?? "").Trim();
+        // ★隔离调用：不写角色 ChatHistory（旧写法会把 1 万字提示词永久留在上下文里）
+        string cards = await AskModelIsolatedAsync(prompt).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(cards))
         {
             // 模型认为没价值：仍记水位，免得反复重试同一个文件
@@ -1296,8 +1498,19 @@ public class MemoryInjectModule(
             return (fresh.Count, "");
         }
 
+        // ★只留事实行：模型回包常夹带 XML/代码（真央那份事实卡就被写进了 <Python>…）
+        string cleanCards = SanitizeFactCards(cards, out int droppedCards);
+        if (droppedCards > 0)
+            logger.LogWarning("记忆书签：整理回包丢弃 {n} 行非事实内容", droppedCards);
+        if (string.IsNullOrWhiteSpace(cleanCards))
+        {
+            // 全是垃圾：不算失败，推进水位，别让同一批反复重喂
+            foreach (var x in fresh) done.Add(x.key);
+            TrySaveState(done);
+            return (fresh.Count, "");
+        }
         // ③ 写入合并：不再直接 AppendAllText —— 先与已有事实合并（重复丢弃、相近合并）
-        string factFile = await AppendFactsAsync(cards).ConfigureAwait(false);
+        string factFile = await AppendFactsAsync(cleanCards).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(factFile))
         {
             logger.LogWarning("记忆书签：模型整理写盘失败（水位不推进，稍后重试）");
@@ -1430,6 +1643,83 @@ public class MemoryInjectModule(
     }
 
     /// <summary>③ 写事实卡：先与已有事实合并（重复丢弃 / 相近合并 / 其余追加），避免事实卡膨胀。</summary>
+    /// <summary>
+    /// 隔离模型调用：用独立的 ChatHistoryAgentThread，**不写角色 ChatHistory**。
+    /// 原来的 chatBot.ChatAsync 会把上万字的整理/压缩提示词永久塞进上下文，
+    /// 把 128k 窗口顶爆，进而触发官方压缩、UI 渲染与改历史打架。
+    /// </summary>
+    async Task<string> AskModelIsolatedAsync(string prompt)
+    {
+        try
+        {
+            ChatHistoryAgentThread thread = new();
+            thread.ChatHistory.AddUserMessage(prompt ?? "");
+            string? resp = await chatBot.LanguageModel.ChatStreamingAsync(thread).ConfigureAwait(false);
+            return (resp ?? "").Trim();
+        }
+        catch (Exception e)
+        {
+            logger.LogWarning(e, "记忆书签：隔离模型调用失败");
+            return "";
+        }
+    }
+
+    /// <summary>事实行格式：日期 | 谁 | 事 | 事实（至少 4 段）。</summary>
+    static bool IsFactLine(string body)
+    {
+        if (string.IsNullOrWhiteSpace(body)) return false;
+        string s = body.TrimStart('-', '*', '・', ' ', '\t').Trim();
+        // 兼容：2026-10-20 / 10/20 / 2026年10月20日（小鲸鱼的事实卡用短日期）
+        if (Regex.IsMatch(s, @"^(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}|\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)\s*\|") == false) return false;
+        return s.Count(ch => ch == '|') >= 3;
+    }
+
+    /// <summary>
+    /// 只保留"事实行"：模型的原始回包可能夹带工具 XML、Python 代码、解释文本，
+    /// 这些绝不能当事实写进事实卡（真央那份就被写进了 &lt;Python&gt; / &lt;Expression/&gt;）。
+    /// </summary>
+    static string SanitizeFactCards(string raw, out int dropped)
+    {
+        dropped = 0;
+        if (string.IsNullOrWhiteSpace(raw)) return "";
+        string text = raw;
+        text = Regex.Replace(text, @"\x60\x60\x60[\s\S]*?\x60\x60\x60", "\n");   // 成对代码围栏
+        text = Regex.Replace(text, @"\x60\x60\x60[\s\S]*$", "\n");               // 未闭合围栏
+        text = Regex.Replace(text, @"<(Python|Speak|Expression|Motion|Poke|Function|Tool)[^>]*>[\s\S]*?</\1\s*>", "\n", RegexOptions.IgnoreCase);
+        text = Regex.Replace(text, @"<[^>\n]{1,100}/>", "\n");                   // 自闭合标签
+        var kept = new List<string>();
+        foreach (string lnRaw in text.Split('\n'))
+        {
+            string ln = lnRaw.Trim();
+            if (ln.Length == 0) continue;
+            string body = ln.TrimStart('-', '*', '・', ' ', '\t').Trim();
+            if (IsFactLine(body))
+            {
+                if (body.Length > 500) body = body.Substring(0, 500);
+                kept.Add("- " + body);
+            }
+            else dropped++;
+        }
+        return string.Join("\n", kept);
+    }
+
+    /// <summary>清洗已有事实卡：保留 # 标题和合法事实行，清掉历史遗留的代码/XML 垃圾。</summary>
+    static string SanitizeExistingFacts(string existing)
+    {
+        if (string.IsNullOrWhiteSpace(existing)) return "";
+        var kept = new List<string>();
+        foreach (string lnRaw in existing.Split('\n'))
+        {
+            string ln = lnRaw.TrimEnd();
+            string t = ln.Trim();
+            if (t.Length == 0) { kept.Add(""); continue; }
+            if (t.StartsWith("#")) { kept.Add(ln); continue; }
+            string body = t.TrimStart('-', '*', '・', ' ', '\t').Trim();
+            if (IsFactLine(body)) kept.Add(ln);
+        }
+        return string.Join("\n", kept).Trim();
+    }
+
     async Task<string> AppendFactsAsync(string cards)
     {
         await factLock.WaitAsync().ConfigureAwait(false);
@@ -1437,8 +1727,13 @@ public class MemoryInjectModule(
         {
             Directory.CreateDirectory(factsRoot);
             string factFile = Path.Combine(factsRoot, "事实_" + DateTime.Now.ToString("yyyyMMdd") + ".md");
-            string existing = File.Exists(factFile) ? File.ReadAllText(factFile) : "";
-            var lines = (cards ?? "").Split('\n').Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
+            // ★先只留事实行：模型回包里的 XML/代码/解释一律丢掉
+            string clean = SanitizeFactCards(cards, out int dropped);
+            if (dropped > 0)
+                logger.LogWarning("记忆书签：事实卡丢弃 {n} 行非事实内容（XML/代码/自由文本）", dropped);
+            if (string.IsNullOrWhiteSpace(clean)) return "";
+            string existing = File.Exists(factFile) ? SanitizeExistingFacts(File.ReadAllText(factFile)) : "";
+            var lines = clean.Split('\n').Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
             if (lines.Count == 0) return "";
             var args = new Dictionary<string, object?>
             {
@@ -1449,7 +1744,7 @@ public class MemoryInjectModule(
             string? merged = await sidecar.AskFieldAsync("factmerge", args, "text", 8000, indexPath).ConfigureAwait(false);
             string body;
             if (string.IsNullOrWhiteSpace(merged))
-                body = (string.IsNullOrEmpty(existing) ? "" : existing.TrimEnd() + "\n") + cards;
+                body = (string.IsNullOrEmpty(existing) ? "" : existing.TrimEnd() + "\n") + clean;
             else
                 body = merged!;
             if (body.TrimStart().StartsWith("#") == false)
@@ -1470,6 +1765,7 @@ public class MemoryInjectModule(
     {
         if (Configuration == null) return 0;
         if (force == false && Configuration.AutoCompactEnable == false) return 0;
+        if (force == false && functionCaller.IsIdle == false) return 0;   // 同上：自动压缩不在回合中插模型调用
         if (sidecar.IsReady == false) return 0;
         if (string.IsNullOrWhiteSpace(memoryRoot) || Directory.Exists(memoryRoot) == false) return 0;
         if (compacting) return 0;
@@ -1503,16 +1799,16 @@ public class MemoryInjectModule(
                     "[消息来源(记忆压缩)]下面的流水来自同一份记忆文件。请压成事实卡，每条一行，格式：\n" +
                     "- 日期 | 涉及谁 | 属哪件事 | 一句话事实\n" +
                     "要求：只留有长期价值的信息（决定、进度、健康状况、约定、重要结论）；去掉寒暄、重复和过程细节；没价值就不写。" +
-                    "直接输出卡片行，不要解释。\n\n" + text;
+                    "只输出事实行：不要调用任何工具（Python/Expression/Speak 等），不要输出代码、XML 或解释。\n\n" + text;
 
-                ChatResult r;
-                try { r = await chatBot.ChatAsync(prompt, breakLast: false).ConfigureAwait(false); }
-                catch (Exception e) { logger.LogWarning(e, "记忆书签：压缩调用失败 {src}", source); continue; }
-                if (r.Exception != null) { logger.LogWarning("记忆书签：压缩出错 {m}", r.Exception.Message); continue; }
-                string cards = (r.AIMessage ?? "").Trim();
+                string cards = await AskModelIsolatedAsync(prompt).ConfigureAwait(false);
                 if (string.IsNullOrWhiteSpace(cards)) { logger.LogInformation("记忆书签：压缩无产出 {src}", source); continue; }
+                string cleanCards = SanitizeFactCards(cards, out int droppedCards);
+                if (droppedCards > 0)
+                    logger.LogWarning("记忆书签：压缩回包丢弃 {n} 行非事实内容 {src}", droppedCards, source);
+                if (string.IsNullOrWhiteSpace(cleanCards)) { logger.LogInformation("记忆书签：压缩无有效事实 {src}", source); continue; }
 
-                string factFile = await AppendFactsAsync(cards).ConfigureAwait(false);
+                string factFile = await AppendFactsAsync(cleanCards).ConfigureAwait(false);
                 if (string.IsNullOrWhiteSpace(factFile)) continue;
                 // ★B：只记"已压缩"，官方文件一个字节都不动（旧版会 Move 到 archive/，那会踩坏官方插件）
                 MarkCompacted(source);
