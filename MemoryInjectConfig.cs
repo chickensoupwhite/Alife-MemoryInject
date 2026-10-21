@@ -15,8 +15,8 @@ public class MemoryInjectConfig
     public bool Enable { get; set; } = true;
 
     [DisplayName("使用语义检索")]
-    [Description("用本地 bge-small 向量模型按意思检索；关闭或模型没就绪时退回字面关键词匹配。")]
-    public bool UseSemantic { get; set; } = true;
+    [Description("默认关闭。开启后仅对关键词已命中的候选做语义重排；不会用向量单独制造命中。模型没就绪时退回关键词匹配。")]
+    public bool UseSemantic { get; set; } = false;
 
     [DisplayName("Python 解释器")]
     [Description("留空使用 PATH 中的 python。需已安装 torch 与 transformers。建议写绝对路径。")]
@@ -35,8 +35,12 @@ public class MemoryInjectConfig
     public int MaxResults { get; set; } = 3;
 
     [DisplayName("绝对相关度下限")]
-    [Description("语义模式余弦相似度下限，低于它不算命中。建议 0.55。")]
+    [Description("本地片段向量检索的余弦下限。建议 0.55。（侧车语义重排用的是下面单独的一项）")]
     public double MinScore { get; set; } = 0.55;
+
+    [DisplayName("侧车语义重排阈值")]
+    [Description("开启语义时，只有相似度达到这个值的候选才会得到最高 +25% 的排序加权；不会单独制造命中。建议 0.58。")]
+    public double SemanticMinScore { get; set; } = 0.58;
 
     [DisplayName("相对相关度阈值（比平均高多少）")]
     [Description("语义模式：命中的片段要比本轮平均相似度高出这么多才算数。越大越严。建议 0.22。")]
@@ -120,6 +124,18 @@ public class MemoryInjectConfig
     [DisplayName("模型整理单次上限（字）")]
     [Description("单次喂给模型的新记忆最多多少字，超了截断。建议 30000。")]
     public int LlmOrganizeMaxChars { get; set; } = 30000;
+
+    [DisplayName("手动整理单批上限（字）")]
+    [Description("memorganize 一次最多喂多少字（默认 12000，比自动整理小，避免占满上下文）。")]
+    public int LlmOrganizeManualMaxChars { get; set; } = 12000;
+
+    [DisplayName("启动后首次整理延迟（分钟）")]
+    [Description("重启后不要立即调用模型；等待这么久再做第一次自动整理。手动 memcompact / memorganize 不受影响。建议 120。")]
+    public int LlmOrganizeStartupDelayMinutes { get; set; } = 120;
+
+    [DisplayName("模型整理单次最多文件数")]
+    [Description("一次模型整理最多处理多少个源文件，防止积压时一口气吃掉大量上下文。建议 5。")]
+    public int LlmOrganizeMaxFilesPerRun { get; set; } = 5;
 
     [DisplayName("提示里强调先调工具")]
     [Description("打开后，命中提示会明确要求模型先用 memrecall / memfetch / memwhen 查，而不是自己去翻磁盘。建议开。")]
