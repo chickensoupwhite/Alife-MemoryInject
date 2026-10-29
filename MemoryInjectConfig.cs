@@ -14,6 +14,18 @@ public class MemoryInjectConfig
     [Description("是否在后台检索记忆，并在命中时追加一句提示。")]
     public bool Enable { get; set; } = true;
 
+    [DisplayName("启用召回入口门控")]
+    [Description("仅控制自动召回是否进入新增门控；关闭时保持 4.8.7 的入口行为。主动记忆工具不受此开关影响。")]
+    public bool RecallGateEnable { get; set; } = false;
+
+    [DisplayName("启用出口过滤与话题断层")]
+    [Description("开启后，自动召回先按话题变化清理当前窗口，再执行出口过滤与重复压制；关闭时保持旧行为。主动记忆工具不受此开关影响。")]
+    public bool RecallFilterEnable { get; set; } = false;
+
+    [DisplayName("统计采集起始时间（UTC）")]
+    [Description("调用统计的可证明起点，使用 ISO 8601 UTC 文本保存。留空表示尚未接入统计；不能用文件修改时间推测历史调用。")]
+    public string StatisticsStartTimeUtc { get; set; } = "";
+
     [DisplayName("使用语义检索")]
     [Description("默认关闭。开启后仅对关键词已命中的候选做语义重排；不会用向量单独制造命中。模型没就绪时退回关键词匹配。")]
     public bool UseSemantic { get; set; } = false;

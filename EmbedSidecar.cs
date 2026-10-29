@@ -12,6 +12,25 @@ using System.Threading.Tasks;
 
 namespace Mao.MemoryRecall;
 
+public sealed class RecallResult
+{
+    public string? Bookmarks { get; }
+    public JsonElement Facts { get; }
+
+    /// <summary>本次空结果是策略（门控/重复压制）判定的，不是"确实没有记忆"。</summary>
+    public bool PolicyBlocked { get; }
+    /// <summary>召回时的窗口代次：回执带上它，迟到回执不会写入新话题窗口。</summary>
+    public int WindowGen { get; }
+
+    public RecallResult(string? bookmarks, JsonElement facts, bool policyBlocked = false, int windowGen = 0)
+    {
+        Bookmarks = bookmarks;
+        Facts = facts;
+        PolicyBlocked = policyBlocked;
+        WindowGen = windowGen;
+    }
+}
+
 /// <summary>
 /// 嵌入计算子进程管理：拉起常驻 Python 服务，通过 stdin/stdout 交换 JSON。
 /// 所有 await 均 ConfigureAwait(false)。
@@ -225,10 +244,13 @@ public sealed class EmbedSidecar : IAsyncDisposable
     /// 走 Task.Run 隔离，不会把同步钩子所在的 UI 线程拖死。
     /// </summary>
     public string? RecallSync(string query, int waitMs, string? indexPath = null, double? halfLife = null, bool? useGraph = null, int skipRecentDays = 0, int topK = 5, bool useSemantic = false, double semanticMinScore = 0.58)
+        => RecallDetailedSync(query, waitMs, indexPath, halfLife, useGraph, skipRecentDays, topK, useSemantic, semanticMinScore)?.Bookmarks;
+
+    public RecallResult? RecallDetailedSync(string query, int waitMs, string? indexPath = null, double? halfLife = null, bool? useGraph = null, int skipRecentDays = 0, int topK = 5, bool useSemantic = false, double semanticMinScore = 0.58, bool recallGate = false, bool recallFilter = false)
     {
         if (IsReady == false || Busy || process == null || process.HasExited) return null;
         int budget = Math.Max(waitMs, 20);
-        Task<string?> t = Task.Run(() => RecallAsync(query, budget * 4, indexPath, halfLife, useGraph, skipRecentDays, topK, useSemantic, semanticMinScore));
+        Task<RecallResult?> t = Task.Run(() => RecallDetailedAsync(query, budget * 4, indexPath, halfLife, useGraph, skipRecentDays, topK, useSemantic, semanticMinScore, "automatic", recallGate, recallFilter));
         try
         {
             if (t.Wait(budget) == false) return null;
@@ -241,7 +263,10 @@ public sealed class EmbedSidecar : IAsyncDisposable
     }
 
     /// <summary>异步召回：发 recall 请求给侧车、拿书签文本；失败返回 null。</summary>
-    public async Task<string?> RecallAsync(string query, int timeoutMs = 800, string? indexPath = null, double? halfLife = null, bool? useGraph = null, int skipRecentDays = 0, int topK = 5, bool useSemantic = false, double semanticMinScore = 0.58)
+    public async Task<string?> RecallAsync(string query, int timeoutMs = 800, string? indexPath = null, double? halfLife = null, bool? useGraph = null, int skipRecentDays = 0, int topK = 5, bool useSemantic = false, double semanticMinScore = 0.58, string entry = "automatic", bool recallGate = false, bool recallFilter = false)
+        => (await RecallDetailedAsync(query, timeoutMs, indexPath, halfLife, useGraph, skipRecentDays, topK, useSemantic, semanticMinScore, entry, recallGate, recallFilter).ConfigureAwait(false))?.Bookmarks;
+
+    public async Task<RecallResult?> RecallDetailedAsync(string query, int timeoutMs = 800, string? indexPath = null, double? halfLife = null, bool? useGraph = null, int skipRecentDays = 0, int topK = 5, bool useSemantic = false, double semanticMinScore = 0.58, string entry = "automatic", bool recallGate = false, bool recallFilter = false)
     {
         if (IsReady == false || process == null || process.HasExited) return null;
         int id = Interlocked.Increment(ref nextId);
@@ -250,7 +275,7 @@ public sealed class EmbedSidecar : IAsyncDisposable
 
         try
         {
-            string payload = JsonSerializer.Serialize(new { id, fn = "recall", query, top_k = Math.Clamp(topK, 1, 20), index = indexPath ?? "", half_life = halfLife, use_graph = useGraph, skip_recent_days = skipRecentDays, use_semantic = useSemantic, semantic_min_score = semanticMinScore });
+            string payload = JsonSerializer.Serialize(new { id, fn = "recall", query, top_k = Math.Clamp(topK, 1, 20), index = indexPath ?? "", half_life = halfLife, use_graph = useGraph, skip_recent_days = skipRecentDays, use_semantic = useSemantic, semantic_min_score = semanticMinScore, entry, recall_gate = recallGate, recall_filter = recallFilter });
             await writeLock.WaitAsync().ConfigureAwait(false);
             try
             {
@@ -272,12 +297,73 @@ public sealed class EmbedSidecar : IAsyncDisposable
             if (root.TryGetProperty("bookmarks", out JsonElement bmEl) == false)
                 return null;
             string? s = bmEl.GetString();
-            return string.IsNullOrWhiteSpace(s) ? null : s;
+            JsonElement facts = root.TryGetProperty("facts", out JsonElement factsEl) && factsEl.ValueKind == JsonValueKind.Array
+                ? factsEl.Clone()
+                : default;
+
+            // ★策略判定必须在"空书签就返回 null"之前完成，否则门控/压制的合法空结果会被丢掉，
+            //   调用方拿到 null 就只能回落旧提示路径，等于绕开新增策略。
+            bool blocked = false;
+            int returned = 0;
+            if (root.TryGetProperty("count", out JsonElement cntEl) && cntEl.ValueKind == JsonValueKind.Number)
+                returned = cntEl.GetInt32();
+            if (root.TryGetProperty("debug", out JsonElement dbg) && dbg.ValueKind == JsonValueKind.Object)
+            {
+                string gate = dbg.TryGetProperty("gate", out JsonElement gEl) ? (gEl.GetString() ?? "off") : "off";
+                string filter = dbg.TryGetProperty("filter", out JsonElement fEl) ? (fEl.GetString() ?? "off") : "off";
+                int suppressed = dbg.TryGetProperty("suppressed", out JsonElement sup)
+                    && sup.ValueKind == JsonValueKind.Number ? sup.GetInt32() : 0;
+                blocked = returned == 0 && (gate != "off" || filter != "off" || suppressed > 0);
+            }
+            int windowGen = root.TryGetProperty("window_gen", out JsonElement genEl)
+                && genEl.ValueKind == JsonValueKind.Number ? genEl.GetInt32() : 0;
+            if (string.IsNullOrWhiteSpace(s) && blocked == false) return null;
+            return new RecallResult(s, facts, blocked, windowGen);
         }
         catch
         {
             pending.TryRemove(id, out _);
             return null;
+        }
+    }
+
+    public bool RecordCallsSync(string callId, string channel, JsonElement facts, string? indexPath = null,
+        int waitMs = 800, string? gapStart = null, int windowGen = 0)
+    {
+        if (facts.ValueKind != JsonValueKind.Array) return true;
+        int budget = Math.Max(waitMs, 20);
+        Task<bool> t = Task.Run(() => RecordCallsAsync(callId, channel, facts, budget * 3, indexPath, gapStart, windowGen));
+        try
+        {
+            return t.Wait(budget) && t.Result;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public async Task<bool> RecordCallsAsync(string callId, string channel, JsonElement facts, int timeoutMs = 1200,
+        string? indexPath = null, string? gapStart = null, int windowGen = 0)
+    {
+        if (facts.ValueKind != JsonValueKind.Array) return true;
+        try
+        {
+            JsonElement? result = await AskJsonAsync("record_calls", new Dictionary<string, object?>
+            {
+                ["call_id"] = callId,
+                ["call_channel"] = channel,
+                ["facts"] = facts.Clone(),
+                ["gap_start"] = gapStart ?? "",
+                ["window_gen"] = windowGen,
+            }, timeoutMs, indexPath).ConfigureAwait(false);
+            return result != null && !result.Value.TryGetProperty("error", out _)
+                && result.Value.TryGetProperty("recorded", out JsonElement count)
+                && count.ValueKind == JsonValueKind.Number;
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -302,6 +388,7 @@ public sealed class EmbedSidecar : IAsyncDisposable
                 id,
                 fn = "recall",
                 query,
+                entry = "memwhen",
                 top_k = Math.Max(1, topK),
                 index = indexPath ?? "",
                 half_life = halfLife,

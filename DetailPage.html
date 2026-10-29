@@ -1,0 +1,2287 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>记忆关系图谱</title>
+<script src="/d3.v7.min.js"></script>
+<style>
+:root{color-scheme:light;--bg:#f7f6f9;--bg2:#efedf3;--surface:#fff;--panel:rgba(255,255,255,.94);--panel-solid:#fff;--text:#242126;--muted:#746c80;--line:rgba(48,35,62,.13);--accent:#7c3aed;--node:#9a7ac5;--seed:#7c3aed;--entry:#8e6caa;--source:#6b6472;--edge:#9c94a5;--canvas-bg:#fcfbfd;--canvas-glow:rgba(124,58,237,.07);--shadow:0 12px 36px rgba(35,25,45,.07);--on-accent:#fff;--radius:18px}
+body.theme-light{color-scheme:light;--bg:#efe9df;--bg2:#e4dccf;--surface:#fffdf8;--panel:rgba(255,253,248,.84);--panel-solid:#fffdf8;--text:#2b2433;--muted:#746a84;--line:rgba(73,60,94,.16);--accent:#7c5cc4;--node:#8d77c7;--seed:#7c5cc4;--entry:#2f9fc4;--source:#c78a3f;--edge:#8c7fa4;--canvas-bg:#f7f2ea;--canvas-glow:rgba(124,92,196,.12);--shadow:0 18px 44px rgba(57,42,80,.10)}
+body.theme-ocean{color-scheme:light;--bg:#e8f4f8;--bg2:#d4e8f0;--surface:#f5fafb;--panel:rgba(245,250,251,.88);--panel-solid:#f5fafb;--text:#1a3a47;--muted:#5a7a87;--line:rgba(42,108,132,.14);--accent:#2a7c9c;--node:#3a8cac;--seed:#2a7c9c;--entry:#1e6f8f;--source:#3aa08c;--edge:#4a9cbc;--canvas-bg:#ecf6f9;--canvas-glow:rgba(42,124,156,.10);--shadow:0 12px 32px rgba(26,58,71,.08)}
+body.theme-forest{color-scheme:light;--bg:#e9f2e6;--bg2:#dce8d8;--surface:#f6faf4;--panel:rgba(246,250,244,.88);--panel-solid:#f6faf4;--text:#2a3c24;--muted:#5a6e54;--line:rgba(58,82,48,.14);--accent:#4a7c3e;--node:#5a8c4e;--seed:#4a7c3e;--entry:#3a6c5e;--source:#8c7c3e;--edge:#6a9c5e;--canvas-bg:#eff5ec;--canvas-glow:rgba(74,124,62,.08);--shadow:0 12px 32px rgba(42,60,36,.08)}
+body.theme-dark{color-scheme:dark;--bg:#15131f;--bg2:#1b1728;--surface:#211c30;--panel:rgba(30,25,45,.84);--panel-solid:#241e35;--text:#eee9f7;--muted:#a79bbd;--line:rgba(180,160,210,.16);--accent:#b794f6;--node:#a88cff;--seed:#c4a7ff;--entry:#67c7e8;--source:#e8b06a;--edge:#6c5f89;--canvas-bg:#171322;--canvas-glow:rgba(183,148,246,.13);--shadow:0 18px 44px rgba(0,0,0,.35)}
+body.theme-glass{color-scheme:light;--bg:#dde8f6;--bg2:#d3def1;--surface:rgba(255,255,255,.38);--panel:rgba(255,255,255,.36);--panel-solid:#edf4ff;--text:#253b58;--muted:#526a86;--line:rgba(255,255,255,.68);--accent:#4969ce;--node:#798ace;--seed:#6863d8;--entry:#259cae;--source:#bb8749;--edge:#7188aa;--canvas-bg:#e6eef8;--canvas-glow:rgba(255,255,255,.3);--shadow:0 18px 48px rgba(49,75,126,.13),inset 0 1px 0 rgba(255,255,255,.85),inset 0 -1px 0 rgba(255,255,255,.2)}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;background-image:radial-gradient(ellipse at 16% 0%,var(--canvas-glow),transparent 42%),radial-gradient(ellipse at 100% 100%,color-mix(in srgb,var(--accent) 5%,transparent),transparent 46%);background-attachment:fixed}
+body.theme-glass{background-image:radial-gradient(ellipse at 8% 12%,rgba(130,161,235,.76),transparent 48%),radial-gradient(ellipse at 88% 16%,rgba(193,170,235,.65),transparent 43%),radial-gradient(ellipse at 72% 90%,rgba(100,195,207,.56),transparent 47%),linear-gradient(125deg,#e7effa,#d4e1f3 55%,#dfdef1)}
+.app{height:100vh;display:grid;grid-template-rows:auto 1fr;gap:12px;padding:16px}
+.top{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 14px;border:1px solid var(--line);border-radius:16px;background:var(--panel);backdrop-filter:blur(18px);box-shadow:var(--shadow)}
+.title{font-weight:800;font-size:17px;letter-spacing:.02em;margin-right:auto;background:linear-gradient(90deg,var(--accent),var(--entry));-webkit-background-clip:text;background-clip:text;color:transparent}
+.legend{display:flex;align-items:center;gap:9px;flex-wrap:wrap;font-size:12px;color:var(--muted)}
+.legend span{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--node);box-shadow:0 0 0 3px color-mix(in srgb,var(--node) 18%,transparent)}
+.dot.seed{background:var(--seed)}.dot.entry{background:var(--entry)}.dot.source{background:var(--source)}
+.line{display:inline-block;width:20px;height:0;border-top:2px solid var(--edge)}
+.line.dash{border-top:2px dashed var(--muted)}
+.search{min-width:220px;flex:1;max-width:440px}
+input,button{font:inherit;color:inherit;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:8px 11px;transition:border-color .15s,box-shadow .15s,background .15s}
+input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 16%,transparent)}
+input::placeholder{color:var(--muted);opacity:.85}
+button{cursor:pointer}button:hover{border-color:var(--accent);box-shadow:0 6px 18px color-mix(in srgb,var(--accent) 14%,transparent)}button:disabled{opacity:.55;cursor:default}
+.workspace{display:grid;grid-template-columns:minmax(0,1fr) 10px var(--side-width,310px);gap:12px;min-height:0}
+.splitter{border-radius:999px;background:color-mix(in srgb,var(--line) 90%,transparent);cursor:col-resize;touch-action:none;align-self:stretch}
+.splitter:hover,.splitter:focus-visible{background:var(--accent);outline:none}
+.splitter.dragging{background:var(--accent)}
+.canvas{position:relative;overflow:hidden;border:1px solid var(--line);border-radius:16px;background:radial-gradient(ellipse at 50% 35%,var(--canvas-glow),transparent 60%),linear-gradient(180deg,var(--canvas-bg),var(--bg2));box-shadow:inset 0 1px 0 rgba(255,255,255,.18)}
+.canvas svg{width:100%;height:100%;touch-action:none;display:block}
+.empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:28px;text-align:center;color:var(--muted);font-size:13px;line-height:1.8;background:var(--canvas-bg);opacity:.94}
+.empty[hidden]{display:none}
+.side{overflow:auto;border:1px solid var(--line);border-radius:16px;padding:16px;background:var(--panel);backdrop-filter:blur(18px);box-shadow:var(--shadow)}
+.muted{color:var(--muted);font-size:12px}
+.detail-title{margin:0 0 8px;font-size:16px;line-height:1.35;word-break:break-word}
+#detail{white-space:pre-wrap;word-break:break-word;line-height:1.7}
+.badge{display:inline-block;max-width:100%;padding:2px 8px;border:1px solid var(--line);border-radius:999px;font-size:11.5px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis;background:color-mix(in srgb,var(--accent) 7%,transparent)}
+.edge{stroke:var(--edge);stroke-opacity:.34;stroke-linecap:round}
+.edge.hierarchy{stroke-dasharray:4 5;stroke-opacity:.62}
+.edge.active{stroke:var(--accent);stroke-opacity:.95;stroke-width:2.6}
+.node{cursor:pointer}
+.node circle{fill:var(--node);stroke:var(--panel-solid);stroke-width:2.5;filter:drop-shadow(0 4px 10px rgba(35,20,60,.20))}
+.node.seed circle{fill:var(--seed)}
+.node.entry circle{fill:var(--entry)}
+.node.source circle{fill:var(--source)}
+.node text{fill:var(--text);font-size:12px;font-weight:600;paint-order:stroke;stroke:var(--canvas-bg);stroke-width:4px;stroke-linejoin:round;pointer-events:none}
+.node.entry text,.node.source text{font-size:10.5px;font-weight:500;opacity:.92}
+.node.dim{opacity:.16}
+.node.hot circle{stroke:#fff;stroke-width:3;filter:drop-shadow(0 0 12px var(--accent))}
+.node.hidden-label text,.node.dense-hidden-label text{display:none}
+.context{position:fixed;z-index:10;display:none;min-width:180px;padding:6px;border:1px solid var(--line);border-radius:12px;background:var(--panel-solid);box-shadow:0 18px 46px rgba(20,12,40,.28);backdrop-filter:blur(18px)}
+.context button{display:block;width:100%;text-align:left;border:0;background:transparent;padding:8px 10px;border-radius:8px;font-size:13px;box-shadow:none}
+.context button:hover{background:color-mix(in srgb,var(--accent) 16%,transparent)}
+.context button[hidden]{display:none}
+.context hr{border:0;border-top:1px solid var(--line);margin:5px 3px}
+.view-tabs{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.view-tabs button[aria-current="page"]{background:var(--accent);color:var(--panel-solid);border-color:var(--accent)}
+.management{min-height:0;overflow:auto;border:1px solid var(--line);border-radius:16px;padding:18px;background:var(--panel);backdrop-filter:blur(18px);box-shadow:var(--shadow)}
+.management[hidden]{display:none}
+.management-head{display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap;margin-bottom:14px}
+.management-head h2{margin:0;font-size:18px}
+.management-head .muted{max-width:780px}
+.management-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+.management-toolbar input{min-width:220px;flex:1;max-width:440px}
+.profile-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 14px}
+.profile-toolbar[hidden]{display:none}
+.profile-toolbar input{min-width:220px;flex:1;max-width:440px}
+.profile-overview{display:grid;grid-template-columns:minmax(220px,1fr) minmax(320px,1.6fr);gap:14px;margin-bottom:14px}
+.profile-summary,.profile-relations{min-width:0;padding:14px;border:1px solid var(--line);border-radius:12px;background:color-mix(in srgb,var(--surface) 72%,transparent)}
+.profile-summary h3{margin:0 0 6px;font-size:18px;word-break:break-word}
+.profile-relations h3{margin:0 0 4px;font-size:14px}
+.profile-graph{width:100%;height:260px;display:block;overflow:visible}
+.profile-link{cursor:pointer}
+.profile-link circle{fill:var(--node);stroke:var(--panel-solid);stroke-width:2}
+.profile-link.center circle{fill:var(--accent)}
+.profile-link text{fill:var(--text);font-size:12px;paint-order:stroke;stroke:var(--panel-solid);stroke-width:4px;stroke-linejoin:round;pointer-events:none}
+.profile-edge{stroke:var(--edge);stroke-opacity:.48;stroke-width:1.5}
+.profile-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.profile-actions button{padding:5px 8px;font-size:12px}
+.profile-note{margin:0 0 10px;padding:9px 11px;border-left:3px solid var(--accent);background:color-mix(in srgb,var(--accent) 6%,transparent)}
+.profile-fact{min-width:230px;max-width:330px}
+.profile-fact strong{display:block;margin-bottom:4px}
+.profile-subtitle{margin:18px 0 8px;font-size:15px}
+.profile-related{display:flex;gap:5px;flex-wrap:wrap;margin-top:6px}
+.profile-related button{padding:3px 7px;font-size:11px}
+.fact-table{width:100%;border-collapse:collapse;min-width:920px}
+.fact-table th,.fact-table td{padding:10px 9px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+.fact-table th{position:sticky;top:0;background:var(--panel-solid);font-size:12px;color:var(--muted);z-index:1}
+.fact-table td{font-size:13px}
+.fact-table tr:hover td{background:color-mix(in srgb,var(--accent) 6%,transparent)}
+.fact-name{font-weight:650;max-width:310px;word-break:break-word}
+.fact-source{max-width:230px;word-break:break-word;color:var(--muted)}
+.table-action{padding:5px 8px;font-size:12px;white-space:nowrap}
+.management-empty{padding:34px 18px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:12px}
+.audit-card{padding:14px;border:1px solid var(--line);border-radius:12px;background:color-mix(in srgb,var(--surface) 70%,transparent);margin-bottom:10px}
+.audit-card strong{display:block;margin-bottom:4px}
+.audit-toolbar{display:flex;align-items:center;gap:10px;margin:0 0 12px}
+.audit-facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px;margin:10px 0}
+.audit-fact{min-width:0;padding:11px;border:1px solid var(--line);border-radius:10px;background:color-mix(in srgb,var(--bg2) 45%,transparent)}
+.audit-fact p{margin:6px 0;white-space:pre-wrap;overflow-wrap:anywhere}
+.audit-source{font-size:12px;color:var(--muted);white-space:pre-wrap;overflow-wrap:anywhere}
+.audit-version{font:11px ui-monospace,monospace;color:var(--muted);overflow-wrap:anywhere}
+.audit-suggestion{display:block;width:100%;min-height:92px;margin:8px 0;resize:vertical}
+.audit-actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}
+.audit-message{margin:0 0 12px;padding:9px 11px;border-radius:10px;background:color-mix(in srgb,var(--accent) 8%,transparent)}
+  .audit-policy{margin:0 0 14px;padding:11px 13px;border:1px solid var(--line);border-radius:12px;background:color-mix(in srgb,var(--accent) 6%,transparent)}
+  .audit-policy strong{display:block;margin-bottom:3px}
+  .audit-history{margin:0 0 16px;padding:13px;border:1px solid var(--line);border-radius:12px;background:color-mix(in srgb,var(--surface) 70%,transparent)}
+  .audit-history h3{margin:0 0 8px;font-size:15px}
+  .audit-history-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:9px 0;border-top:1px solid var(--line)}
+  .audit-history-row:first-of-type{border-top:0}
+  .audit-history-main{min-width:220px;flex:1}
+  .audit-history-main strong{display:inline;margin:0 5px 0 0}
+  .audit-history-meta{color:var(--muted);font-size:12px;overflow-wrap:anywhere}
+  .audit-history-row button{padding:5px 8px;font-size:12px}
+/* Appearance stays separate from graph layout and interaction state. */
+body{font-family:"Segoe UI Variable","Segoe UI","Microsoft YaHei",system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+.app{gap:16px;padding:22px;max-width:2000px;margin:auto}
+.top{display:block;padding:18px 20px;border-radius:var(--radius);backdrop-filter:none}
+.top-heading,.top-toolbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.top-heading{margin-bottom:17px}
+.top-toolbar{padding-top:15px;border-top:1px solid var(--line);gap:8px}
+.brand{display:flex;align-items:center;gap:11px;margin-right:auto;min-width:205px}
+.brand-mark{position:relative;display:grid;place-items:center;flex:0 0 39px;height:39px;border:1px solid color-mix(in srgb,var(--accent) 20%,transparent);border-radius:13px;background:color-mix(in srgb,var(--accent) 9%,var(--surface));color:var(--accent)}
+.brand-mark svg{width:24px;height:24px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round}
+.eyebrow{font-size:9px;letter-spacing:.2em;font-weight:700;color:var(--muted);margin-bottom:1px}
+.title{margin:0;font-size:18px;font-weight:700;letter-spacing:.025em;color:var(--text);background:none}
+.header-tools{display:flex;gap:10px;align-items:center;margin-left:auto}
+.view-tabs{padding:4px;gap:3px;background:color-mix(in srgb,var(--bg2) 70%,transparent);border:1px solid var(--line);border-radius:12px}
+.view-tabs button{background:transparent;border-color:transparent;padding:7px 13px;box-shadow:none;font-size:13px;color:var(--muted)}
+.view-tabs button[aria-current="page"]{background:var(--surface);color:var(--accent);border-color:var(--line);box-shadow:0 2px 7px rgba(40,55,100,.07);font-weight:650}
+.search{max-width:390px;min-width:170px}
+.legend{margin-left:auto;gap:14px;padding-left:8px;font-size:11px}
+input,button,select,textarea{font:inherit;color:var(--text);border:1px solid var(--line);border-radius:10px;background:var(--surface);padding:8px 11px;transition:background-color .18s,border-color .18s,box-shadow .18s,transform .18s}
+input,select{min-height:37px}select{cursor:pointer;font-size:12px;max-width:100%}
+select option{background:var(--panel-solid);color:var(--text)}
+button:enabled:hover{transform:translateY(-1px);box-shadow:0 4px 12px color-mix(in srgb,var(--accent) 12%,transparent)}
+button:enabled:active{transform:translateY(0);box-shadow:none}
+button:disabled{transform:none;box-shadow:none}
+button:focus-visible,select:focus-visible,input:focus-visible,textarea:focus-visible,.fact-table tr:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+#searchBtn,#openProfileBtn{background:var(--accent);color:var(--on-accent);border-color:transparent;box-shadow:0 3px 10px color-mix(in srgb,var(--accent) 18%,transparent)}
+#themeBtn{min-width:108px;background:color-mix(in srgb,var(--accent) 5%,var(--surface));font-size:12px}
+#zoomText{font-variant-numeric:tabular-nums;min-width:34px;text-align:right}
+.workspace{gap:14px;grid-template-columns:minmax(0,1fr) 6px var(--side-width,310px)}
+.workspace[hidden],.management-toolbar[hidden],.audit-toolbar[hidden],.legend[hidden]{display:none}
+.canvas,.side,.management{border-radius:var(--radius)}
+.canvas{background-image:radial-gradient(var(--line) .8px,transparent .8px),radial-gradient(ellipse at 50% 35%,var(--canvas-glow),transparent 65%);background-size:22px 22px,100% 100%;background-color:var(--canvas-bg)}
+.side{padding:20px;backdrop-filter:none;line-height:1.7}
+.splitter{background:transparent;position:relative}
+.splitter::after{content:"";position:absolute;top:44%;bottom:44%;left:1px;width:4px;border-radius:8px;background:var(--line);transition:background .18s}
+.splitter:hover{background:color-mix(in srgb,var(--accent) 7%,transparent)}
+.splitter:hover::after,.splitter.dragging::after{background:var(--accent)}
+.detail-title{font-size:17px;margin-bottom:12px}
+.badge{padding:4px 10px;border-color:color-mix(in srgb,var(--accent) 15%,transparent);background:color-mix(in srgb,var(--accent) 7%,transparent);color:var(--accent);font-weight:600}
+.management{padding:24px;backdrop-filter:none;scrollbar-gutter:stable}
+.management-head{padding-bottom:18px;margin-bottom:18px;border-bottom:1px solid var(--line)}
+.management-head h2{font-size:21px;letter-spacing:.01em;margin-bottom:5px}
+.management-head .muted{line-height:1.8;max-width:920px}
+.management-toolbar,.profile-toolbar{gap:9px;margin-bottom:18px}
+.fact-table{border-spacing:0;border-collapse:separate}
+.fact-table th{font-weight:650;font-size:11px;letter-spacing:.02em;padding:12px 11px}
+.fact-table td{padding:13px 11px;line-height:1.65}
+.fact-table tbody tr td{transition:background-color .16s}
+.fact-table tbody tr:nth-child(even) td{background:color-mix(in srgb,var(--bg2) 25%,transparent)}
+.fact-table tbody tr:hover td{background:color-mix(in srgb,var(--accent) 7%,transparent)}
+.fact-name{color:var(--text)}
+.table-action{background:transparent;color:var(--accent);border-color:color-mix(in srgb,var(--accent) 18%,transparent);padding:5px 9px;font-size:11px}
+.profile-summary,.profile-relations,.audit-card,.audit-history{border-radius:14px;padding:18px}
+.profile-summary h3{font-size:20px;letter-spacing:.02em}
+.profile-impression{margin-top:20px;padding-top:17px;border-top:1px solid var(--line)}
+.profile-impression p{line-height:1.8}
+.profile-actions{gap:8px}.profile-actions button,.profile-related button{border-radius:8px}
+.audit-policy{padding:15px 17px;border-radius:13px;line-height:1.7}
+.audit-fact{padding:14px;border-radius:11px}
+.audit-suggestion{line-height:1.8;padding:12px;min-height:100px}
+.audit-actions button:first-child{background:var(--accent);color:var(--on-accent);border-color:transparent}
+.audit-history-row{padding:13px 0}
+.management-empty{padding:48px 24px;line-height:1.9;background:color-mix(in srgb,var(--surface) 50%,transparent)}
+.context{padding:7px;border-radius:13px;background:var(--panel-solid)}
+.context button{font-size:12px;padding:9px 11px;transform:none}
+.context button[data-action="profile-fact-retire"]{color:#bd5454}
+.empty{background:color-mix(in srgb,var(--canvas-bg) 90%,transparent)}
+.top,.side,.management{animation:surface-enter .24s ease-out both}
+.side{animation-delay:.04s}
+@keyframes surface-enter{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
+body.theme-dark{--on-accent:#201b30}
+body.theme-glass .top,body.theme-glass .side,body.theme-glass .management{background:var(--panel);-webkit-backdrop-filter:blur(26px) saturate(145%);backdrop-filter:blur(26px) saturate(145%);border-color:rgba(255,255,255,.65);box-shadow:var(--shadow)}
+body.theme-glass .canvas{background-color:rgba(244,249,255,.18);background-image:radial-gradient(rgba(83,111,164,.13) .8px,transparent .8px);box-shadow:inset 0 1px 0 rgba(255,255,255,.8),0 12px 36px rgba(49,75,126,.08);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
+body.theme-glass .profile-summary,body.theme-glass .profile-relations,body.theme-glass .audit-card,body.theme-glass .audit-history{background:rgba(255,255,255,.24);box-shadow:inset 0 1px 0 rgba(255,255,255,.55)}
+body.theme-glass .view-tabs{background:rgba(235,243,255,.27)}
+body.theme-glass .view-tabs button[aria-current="page"]{background:rgba(255,255,255,.62)}
+body.theme-glass .fact-table th{background:rgba(239,247,255,.8);-webkit-backdrop-filter:blur(16px);backdrop-filter:blur(16px)}
+body.theme-glass .context{background:rgba(243,248,255,.78);-webkit-backdrop-filter:blur(24px) saturate(145%);backdrop-filter:blur(24px) saturate(145%)}
+body.theme-glass .empty{background:rgba(239,247,255,.35)}
+@supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){body.theme-glass .top,body.theme-glass .side,body.theme-glass .management,body.theme-glass .context{background:#edf3fc}}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+@media (max-width:1100px){.legend{width:100%;padding:6px 0 0;margin-left:0}.top-heading{gap:12px}.header-tools{margin-left:0}.brand{flex:1}.view-tabs{order:3;width:100%}}
+@media (max-width:760px){.app{padding:10px;gap:10px}.top{padding:14px}.top-toolbar{gap:7px}.workspace{grid-template-columns:1fr;grid-template-rows:minmax(0,1fr) 220px}.side{order:2}.splitter{display:none}.profile-overview{grid-template-columns:1fr}.profile-graph{height:220px}.management{padding:15px}.view-tabs button{flex:1;padding:7px 9px;font-size:12px}.title{font-size:16px}.search{width:100%;flex-basis:100%;max-width:none}.management-toolbar input,.profile-toolbar input{min-width:140px;max-width:none}.legend{font-size:10px;gap:10px}}
+</style>
+</head>
+<body class="theme-native">
+<div class="app">
+  <header class="top">
+    <div class="top-heading">
+    <div class="brand"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M6 6l12 3-8 9-4-12M6 6l4 12M6 6l12 3"/><circle cx="6" cy="6" r="2.5" fill="currentColor" stroke="none"/><circle cx="18" cy="9" r="2.5" fill="currentColor" stroke="none"/><circle cx="10" cy="18" r="2.5" fill="currentColor" stroke="none"/></svg></span><div><div class="eyebrow">MEMORY INJECT</div><div class="title">记忆关系图谱</div></div></div>
+    <nav class="view-tabs" aria-label="视图切换">
+      <button id="graphViewBtn" type="button" aria-current="page">图谱</button>
+      <button id="managementViewBtn" type="button" aria-current="false">事实卡管理</button>
+      <button id="profileViewBtn" type="button" aria-current="false">人事物画像</button>
+      <button id="auditViewBtn" type="button" aria-current="false">审计</button>
+    </nav>
+    <div class="header-tools"><select id="themeBtn" aria-label="外观主题" title="切换外观主题"><option value="native">原生 · 黑白紫</option><option value="light">暖白 · 鸢尾</option><option value="ocean">海洋 · 青蓝</option><option value="forest">森林 · 松绿</option><option value="dark">暗夜 · 紫灰</option><option value="glass">玻璃 · 晨雾</option></select><span id="zoomText" class="muted">100%</span></div>
+    </div>
+    <div class="top-toolbar">
+    <input id="query" class="search" placeholder="搜索人物 / 主题 / 事物" aria-label="搜索记忆关系">
+    <button id="searchBtn" type="button">搜索并展开</button>
+    <button id="overviewBtn" type="button">全库概览</button>
+    <button id="moreBtn" type="button" hidden>加载更多关系</button>
+    <div class="legend" aria-label="图例"><span><i class="dot seed"></i>实体</span><span><i class="dot entry"></i>条目</span><span><i class="dot source"></i>来源文件</span><span><i class="line"></i>共现</span><span><i class="line dash"></i>层级</span></div>
+    </div>
+  </header>
+  <main class="workspace">
+    <section id="canvas" class="canvas">
+      <svg id="graph" viewBox="0 0 1200 800" aria-label="记忆关系图谱"></svg>
+      <div id="empty" class="empty" hidden></div>
+    </section>
+    <div id="sideSplitter" class="splitter" role="separator" aria-orientation="vertical"
+         aria-label="拖动调整右侧面板宽度" tabindex="0" title="拖动调整面板宽度（双击复位）"></div>
+    <aside class="side">
+      <h3 class="detail-title" id="detailTitle">图谱说明</h3>
+      <div class="muted" id="detail">滚轮缩放，拖拽平移。拖动节点可调整位置。拉远后隐藏节点文字，拉近显示条目名称。悬停可高亮邻接关系；左键查看条目详情，右键打开操作栏。节点大小代表直接关联数，不代表真实子条目数。</div>
+      <hr style="border:0;border-top:1px solid var(--line);margin:14px 0">
+      <div class="muted" id="stats">尚未载入图谱</div>
+      <div id="neighbors"></div>
+    </aside>
+  </main>
+  <section id="management" class="management" hidden aria-label="事实卡管理">
+    <div class="management-head">
+      <div>
+        <h2 id="managementTitle">事实卡管理</h2>
+        <div id="managementDescription" class="muted">只读浏览当前索引中的事实卡与关联实体。调用统计只显示已确认的成功交付；没有可核实历史时明确标注。<strong>注：调用统计用于观察趋势，技术重试会导致重复计数（已知限制，影响 &lt;5%）。</strong></div>
+      </div>
+      <span id="managementStatus" class="badge">等待索引数据</span>
+    </div>
+    <div id="managementToolbar" class="management-toolbar">
+      <input id="factQuery" type="search" placeholder="筛选事实卡、人物、事或物">
+      <button id="refreshFactsBtn" type="button">刷新当前数据</button>
+      <select id="factSort" aria-label="事实卡排序">
+        <option value="name">按名称排序</option>
+        <option value="call_count">按调用总数排序</option>
+        <option value="calls_7d">按近 7 日观察数排序</option>
+        <option value="importance">按重要度排序</option>
+        <option value="last_called">按最后调用时间排序</option>
+      </select>
+      <select id="usageFilter" aria-label="调用情况筛选">
+        <option value="">全部调用情况</option>
+        <option value="used">统计范围内已调用</option>
+        <option value="unused">统计范围内未调用</option>
+      </select>
+      <select id="importanceFilter" aria-label="重要度筛选">
+        <option value="">全部重要度</option>
+        <option value="known">已设置重要度</option>
+        <option value="unset">重要度未设置</option>
+      </select>
+    </div>
+    <div id="profileToolbar" class="profile-toolbar" hidden>
+      <select id="profileKind" aria-label="画像类别">
+        <option value="auto">自动识别类别</option>
+        <option value="person">人物</option>
+        <option value="event">事件／主题</option>
+        <option value="object">事物</option>
+      </select>
+      <input id="profileQuery" type="search" placeholder="输入标签精确查找人物、事件或事物">
+      <button id="openProfileBtn" type="button">打开画像</button>
+      <button id="entityListBtn" type="button" title="不输入名字，直接浏览事实卡里的标签">浏览标签列表</button>
+      <select id="profileSort" aria-label="画像事实卡排序">
+        <option value="name">按名称排序</option>
+        <option value="call_count">按调用总数排序</option>
+        <option value="calls_7d">按近 7 日排序</option>
+        <option value="last_called">按最后调用时间排序</option>
+        <option value="importance">按重要度排序</option>
+      </select>
+      <select id="profileUsage" aria-label="画像调用情况筛选">
+        <option value="">全部调用情况</option>
+        <option value="used">统计范围内已调用</option>
+        <option value="unused">统计范围内未调用</option>
+      </select>
+      <select id="profileImportance" aria-label="画像重要度筛选">
+        <option value="">全部重要度</option>
+        <option value="known">已设置重要度</option>
+        <option value="unset">重要度未设置</option>
+      </select>
+    </div>
+    <div id="auditToolbar" class="audit-toolbar" hidden>
+      <button id="refreshAuditBtn" type="button">刷新审计候选</button>
+      <span id="auditHint" class="muted">高置信重复自动合并；低置信重复和冲突由人工确认。所有操作均可查看，合并和软删可按记录撤回。</span>
+    </div>
+    <div id="managementBody"></div>
+    <div class="management-toolbar" id="factsPagination" aria-label="事实卡分页">
+      <button id="previousFactsBtn" type="button">上一页</button>
+      <span id="factsPageStatus" class="muted">尚未载入</span>
+      <button id="nextFactsBtn" type="button">下一页</button>
+    </div>
+  </section>
+</div>
+<div id="context" class="context" role="menu">
+  <button type="button" data-action="open" data-node-only>查看条目详情</button>
+  <button type="button" data-action="profile-fact-edit" data-profile-fact-only>直接编辑正文（无需审计候选）</button>
+  <button type="button" data-action="profile-fact-retire" data-profile-fact-only>直接软删此卡（无需审计候选）</button>
+  <hr data-profile-fact-only>
+  <button type="button" data-action="profile-fact-audit" data-profile-fact-only>修改／合并（打开审计候选）</button>
+  <button type="button" data-action="profile-fact-soft-delete" data-profile-fact-only>确认软删（审计候选）</button>
+  <button type="button" data-action="profile" data-node-only>打开人／事／物画像</button>
+  <button type="button" data-action="copy" data-node-only>复制条目名称</button>
+  <button type="button" data-action="search" data-node-only>以此节点搜索</button>
+  <button type="button" data-action="expand" data-node-only>展开子节点</button>
+  <button type="button" data-action="collapse" data-node-only>折叠至当前节点</button>
+  <hr data-node-only>
+  <button type="button" data-action="reset-node" data-node-only>重置此节点位置</button>
+  <button type="button" data-action="reset-layout">重置所有布局</button>
+  <hr data-node-only>
+  <button type="button" data-action="copy-source" data-node-only>复制来源路径</button>
+</div>
+<script>
+(() => {
+'use strict';
+const $ = id => document.getElementById(id);
+const svg = $('graph'), canvas = $('canvas');
+const NS = 'http://www.w3.org/2000/svg';
+const MAX_VIEW_NODES = 400;
+let data = {nodes: [], edges: [], truncated: false};
+let positions = new Map();
+let pinned = new Map();
+let simulation = null;
+let simulationNodes = [];
+let zoom = 1, pan = {x: 0, y: 0}, drag = null;
+let nodeDrag = null;
+let suppressClick = false;
+let selected = null, hover = null;
+let loading = false;
+let managementFacts = [];
+let managementTotal = 0;
+let managementOffset = 0;
+const MANAGEMENT_PAGE_SIZE = 50;
+let managementRequest = 0;
+let managementLoaded = false;
+let managementError = '';
+let managementSearchTimer = null;
+let auditIssues = [];
+  let auditHistory = [];
+let auditRequest = 0;
+let auditLoaded = false;
+// 审计候选与图谱共用同一个数据版本：编辑/软删后切回审计页必须重新扫描，
+// 否则会拿旧正文的候选去做合并（这正是上一轮 P1-1 的表现）。
+let auditRevision = -1;
+let auditError = '';
+let auditNotice = '';
+let auditSubmitting = false;
+let profileRequest = 0;
+let profileState = {name: '', kind: 'auto', offset: 0, limit: 50, sort: 'name', usage: '', importance: '', data: null, error: ''};
+let profileSimulation = null;
+let profileFactMenu = false;
+
+function setStatus(text) { $('stats').textContent = text; }
+function setDetail(title, text) { $('detailTitle').textContent = title; $('detail').textContent = text; }
+function clearNeighbors() { $('neighbors').replaceChildren(); }
+function labelOf(id) { const n = data.nodes.find(x => x.id === id); return n ? (n.label || n.id) : id; }
+function shortText(value, max) {
+  const s = String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
+  return s.length > max ? s.slice(0, max - 1) + '…' : s;
+}
+function nodeKindText(kind) {
+  return kind === 'seed' ? '实体' : kind === 'entry' ? '记忆条目' : kind === 'source' ? '来源文件' : kind === 'neighbor' ? '关联实体' : '实体';
+}
+
+function loadPinned() {
+  try {
+    const saved = localStorage.getItem('memory-graph-layout');
+    if (saved) {
+      const obj = JSON.parse(saved);
+      pinned = new Map(Object.entries(obj).map(([k, v]) => [k, v]));
+      console.log('[持久化] 已加载 ' + pinned.size + ' 个固定位置');
+    }
+  } catch (e) { console.error('[持久化] 加载失败:', e); }
+}
+
+function savePinned() {
+  try {
+    const obj = Object.fromEntries(pinned);
+    localStorage.setItem('memory-graph-layout', JSON.stringify(obj));
+    console.log('[持久化] 已保存 ' + pinned.size + ' 个固定位置');
+  } catch (e) { console.error('[持久化] 保存失败:', e); }
+}
+
+async function fetchGraph(params) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const r = await fetch('/graph?' + params.toString(), {cache: 'no-store', signal: controller.signal});
+    let payload = null;
+    try { payload = await r.json(); } catch (e) { /* keep null */ }
+    if (!r.ok) throw new Error((payload && payload.error) || ('HTTP ' + r.status));
+    if (!payload || !Array.isArray(payload.nodes) || !Array.isArray(payload.edges)) throw new Error('图谱数据格式不正确');
+    return payload;
+  } catch (e) {
+    if (e && e.name === 'AbortError') throw new Error('请求超时');
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function edgeKey(e) {
+  return [e.source, e.target].sort().join('\u0000') + '\u0000' + (e.type || '') + '\u0000' + (e.kind || '');
+}
+
+function mergeGraph(next, expandId) {
+  const nodes = new Map();
+  data.nodes.forEach(n => nodes.set(n.id, n));
+  next.nodes.forEach(n => nodes.set(n.id, Object.assign({}, nodes.get(n.id) || {}, n)));
+  const edges = new Map();
+  data.edges.concat(next.edges || []).forEach(e => edges.set(edgeKey(e), e));
+  data = {
+    nodes: [...nodes.values()],
+    edges: [...edges.values()],
+    truncated: !!(data.truncated || next.truncated)
+  };
+  if (data.nodes.length > MAX_VIEW_NODES) trimView(expandId);
+}
+
+function trimView(keepId) {
+  const deg = new Map();
+  data.edges.forEach(e => {
+    deg.set(e.source, (deg.get(e.source) || 0) + 1);
+    deg.set(e.target, (deg.get(e.target) || 0) + 1);
+  });
+  const ordered = data.nodes.slice().sort((a, b) => {
+    if ((b.id === keepId) - (a.id === keepId)) return (b.id === keepId) - (a.id === keepId);
+    return (deg.get(b.id) || 0) - (deg.get(a.id) || 0);
+  });
+  const allowed = new Set(ordered.slice(0, MAX_VIEW_NODES).map(n => n.id));
+  data.nodes = data.nodes.filter(n => allowed.has(n.id));
+  data.edges = data.edges.filter(e => allowed.has(e.source) && allowed.has(e.target));
+  data.truncated = true;
+}
+
+// 分页上下文：{q, all, expand, includeEntries, relationLimit, nextOffset, hasMore, shown, total}
+let graphPage = null;
+// 数据版本：任何会改变图谱内容的操作（编辑/软删/撤回/审计）都要 ++，
+// 切回图谱页时若版本不一致就重新取数，避免画布停在旧图上（实测：全都删了图还在）。
+let dataRevision = 0;
+let graphLoadedRevision = 0;
+// 记住上一次的图谱查询，数据变化后按同一条件重取，避免"编辑完回来搜索没了"
+let lastGraphQuery = '';
+let lastGraphAll = true;
+
+// 首次请求到底要不要关联条目：搜索默认要、概览默认不要。
+// 这个判断只能算一次并**存进分页上下文**，否则"首次请求带了、加载更多却没带"，
+// 剩余关联条目就失去入口（第四轮复核 §4 的同类问题）。
+function graphIncludeEntries(q, all, includeEntries) {
+  return !!(includeEntries || (!all && q));
+}
+
+async function load(q = '', all = false, expand = '', includeEntries = false) {
+  if (loading) return;
+  loading = true;
+  $('searchBtn').disabled = true;
+  $('overviewBtn').disabled = true;
+  setStatus(expand ? '正在展开…' : '正在读取…');
+  const requestEntries = graphIncludeEntries(q, all, includeEntries);
+  const params = new URLSearchParams({
+    query: q,
+    all: all ? '1' : '0',
+    expand: expand,
+    include_entries: requestEntries ? '1' : '0'
+  });
+  try {
+    const next = await fetchGraph(params);
+    if (expand) {
+      mergeGraph(next, expand);
+      setStatus(`${data.nodes.length} 个节点 · ${data.edges.length} 条关系（已展开 ${shortText(labelOf(expand), 16)}）` + (next.truncated ? ' · 子图已截断' : ''));
+    } else {
+      data = next;
+      const hidden = Number(next.retired_hidden) || 0;
+      setStatus(`${data.nodes.length} 个节点 · ${data.edges.length} 条关系` +
+                (data.truncated ? ' · 已截断' : '') +
+                (hidden ? ` · 已隐藏 ${hidden} 张软删卡` : ''));
+    }
+    // 记录分页上下文：加载更多沿用同一组查询参数，只推进各自的游标。
+    // 关系与关联条目是两组独立数据，必须各记一个游标；只要任一组还有数据就要留入口。
+    graphPage = {
+      q, all, expand, includeEntries: requestEntries,
+      relationLimit: 30,
+      nextOffset: Number(next.next_offset) || 0,
+      hasMore: !!next.has_more,
+      shown: Number(next.returned) || 0,
+      total: Number(next.total_relations) || 0,
+      nextEntryOffset: (Number(next.entry_offset) || 0) + (Number(next.entries_returned) || 0),
+      entriesHasMore: !!next.entries_has_more,
+      entryShown: Number(next.entries_returned) || 0,
+      entryTotal: Number(next.total_entries) || 0
+    };
+    graphLoadedRevision = dataRevision;
+    lastGraphQuery = q;
+    lastGraphAll = !!all;
+    if (!data.nodes.length) {
+      showEmpty(q ? '没有找到匹配的关系。换个关键词，或先构建索引。' : '索引里还没有可展示的关系。请先在插件里构建索引。');
+    } else {
+      hideEmpty();
+    }
+    draw();
+  } catch (e) {
+    data = {nodes: [], edges: [], truncated: false};
+    graphPage = null;
+    draw();
+    const msg = '图谱服务未连接：' + e.message + '。请从 Alife 插件 UI 使用“打开管理页面”启动。';
+    showEmpty(msg);
+    setStatus(msg);
+  } finally {
+    loading = false;
+    $('searchBtn').disabled = false;
+    $('overviewBtn').disabled = false;
+    updateMoreButton();
+  }
+}
+
+// 分页上下文：{q, all, expand, includeEntries, relationLimit, nextOffset, hasMore, shown, total}
+function updateMoreButton() {
+  const btn = $('moreBtn');
+  if (!btn) return;
+  const more = !!(graphPage && (graphPage.hasMore || graphPage.entriesHasMore));
+  btn.hidden = !more;
+  btn.disabled = !more || loading;
+  if (more) {
+    const parts = [];
+    if (graphPage.hasMore) parts.push(`关系 ${graphPage.shown} / ${graphPage.total}`);
+    if (graphPage.entriesHasMore) parts.push(`关联条目 ${graphPage.entryShown} / ${graphPage.entryTotal}`);
+    btn.textContent = `加载更多（${parts.join('，')}）`;
+  }
+}
+
+async function loadMore() {
+  if (loading || !graphPage || (!graphPage.hasMore && !graphPage.entriesHasMore)) return;
+  const page = graphPage;
+  loading = true;
+  $('moreBtn').disabled = true;
+  $('searchBtn').disabled = true;
+  $('overviewBtn').disabled = true;
+  setStatus('正在加载更多…');
+  const params = new URLSearchParams({
+    query: page.q || '',
+    all: page.all ? '1' : '0',
+    expand: page.expand || '',
+    include_entries: page.includeEntries ? '1' : '0',
+    offset: String(page.nextOffset || 0),
+    entry_offset: String(page.nextEntryOffset || 0),
+    relation_limit: String(page.relationLimit || 30)
+  });
+  try {
+    const next = await fetchGraph(params);
+    mergeGraph(next, page.expand || '');
+    page.nextOffset = Number(next.next_offset) ||
+      ((Number(params.get('offset')) || 0) + (Number(next.returned) || 0));
+    page.nextEntryOffset = (Number(next.entry_offset) || 0) + (Number(next.entries_returned) || 0);
+    page.hasMore = !!next.has_more;
+    page.entriesHasMore = !!next.entries_has_more;
+    page.shown = (page.shown || 0) + (Number(next.returned) || 0);
+    page.entryShown = (page.entryShown || 0) + (Number(next.entries_returned) || 0);
+    page.total = Number(next.total_relations) || page.total;
+    page.entryTotal = Number(next.total_entries) || page.entryTotal;
+    setStatus(`${data.nodes.length} 个节点 · ${data.edges.length} 条关系（已加载 ${page.shown}/${page.total} 条关系` +
+              (page.entriesHasMore || page.entryShown ? `，${page.entryShown}/${page.entryTotal} 条关联条目` : '') + '）' +
+              (page.hasMore || page.entriesHasMore ? ' · 还有更多'
+                : (next.truncated ? ' · 节点上限已截断' : ' · 已全部加载')));
+    draw();
+  } catch (e) {
+    setStatus('加载更多失败：' + (e.message || '请求失败') + '。已保留当前已加载的关系。');
+  } finally {
+    loading = false;
+    $('searchBtn').disabled = false;
+    $('overviewBtn').disabled = false;
+    updateMoreButton();
+  }
+}
+
+function showEmpty(text) {
+  const el = $('empty');
+  el.textContent = text;
+  el.hidden = false;
+}
+function hideEmpty() { $('empty').hidden = true; }
+
+function project() {
+  const w = svg.clientWidth || 1200;
+  const h = svg.clientHeight || 800;
+  svg.setAttribute('viewBox', `${-pan.x / zoom} ${-pan.y / zoom} ${w / zoom} ${h / zoom}`);
+  $('zoomText').textContent = Math.round(zoom * 100) + '%';
+}
+
+function resizeGraph() {
+  project();
+  if (!simulation || !window.d3) return;
+  const w = svg.clientWidth || 1200;
+  const h = svg.clientHeight || 800;
+  simulation.force('center', window.d3.forceCenter(w / 2, h / 2).strength(0.08));
+  simulation.force('x').x(w / 2);
+  simulation.force('y').y(h / 2);
+  simulation.alpha(0.18).restart();
+}
+
+function applyZoom() {
+  svg.querySelectorAll('.node').forEach(g => g.classList.toggle('hidden-label', zoom < 0.72));
+}
+
+function draw() {
+  if (simulation) {
+    simulation.stop();
+    simulation.on('tick', null);
+    simulation = null;
+  }
+  svg.replaceChildren();
+  simulationNodes = [];
+  loadPinned();
+  if (!data.nodes.length) {
+    positions.clear();
+    return;
+  }
+  if (!window.d3 || !window.d3.forceSimulation) {
+    showEmpty('D3 graph component did not load. Restart the graph server and try again.');
+    setStatus('D3 graph component did not load');
+    return;
+  }
+
+  const w = svg.clientWidth || 1200;
+  const h = svg.clientHeight || 800;
+  const cx = w / 2, cy = h / 2;
+  const dense = data.nodes.length > 55;
+  const degree = new Map();
+  data.edges.forEach(e => {
+    degree.set(e.source, (degree.get(e.source) || 0) + 1);
+    degree.set(e.target, (degree.get(e.target) || 0) + 1);
+  });
+  const nodeIds = new Set(data.nodes.map(n => n.id));
+  positions = new Map([...positions].filter(([id]) => nodeIds.has(id)));
+  const nodeById = new Map();
+  simulationNodes = data.nodes.map((v, i) => {
+    const old = positions.get(v.id);
+    const fixed = pinned.get(v.id);
+    const angle = i * 2.399963229728653;
+    const spread = 10 * Math.sqrt(i + 1);
+    const x = fixed && Number.isFinite(+fixed.x) ? +fixed.x : old && Number.isFinite(+old.x) ? +old.x : cx + Math.cos(angle) * spread;
+    const y = fixed && Number.isFinite(+fixed.y) ? +fixed.y : old && Number.isFinite(+old.y) ? +old.y : cy + Math.sin(angle) * spread;
+    const node = Object.assign({}, v, {x, y});
+    if (fixed) { node.fx = x; node.fy = y; }
+    nodeById.set(node.id, node);
+    return node;
+  });
+
+  const simulationLinks = data.edges
+    .filter(e => nodeById.has(e.source) && nodeById.has(e.target))
+    .map(e => ({...e, source: e.source, target: e.target, sourceId: e.source, targetId: e.target}));
+  const edgeElements = [];
+  simulationLinks.forEach(e => {
+    const line = document.createElementNS(NS, 'line');
+    line.classList.add('edge');
+    line.classList.toggle('hierarchy', e.kind === 'hierarchy');
+    line.dataset.a = e.sourceId;
+    line.dataset.b = e.targetId;
+    line.setAttribute('stroke-width', String(Math.min(6, 1 + Math.log2(Math.max(1, e.weight || 1)))));
+    const title = document.createElementNS(NS, 'title');
+    title.textContent = `${e.type || '共现'} · 权重 ${e.weight || 1}`;
+    line.append(title);
+    svg.append(line);
+    edgeElements.push({link: e, element: line});
+  });
+
+  const nodeElements = new Map();
+  simulationNodes.forEach(v => {
+    const deg = degree.get(v.id) || 0;
+    const radius = Math.min(34, 9 + Math.sqrt(deg) * 4);
+    const g = document.createElementNS(NS, 'g');
+    g.classList.add('node');
+    if (v.kind === 'seed') g.classList.add('seed');
+    if (v.kind === 'entry') g.classList.add('entry');
+    if (v.kind === 'source') g.classList.add('source');
+    if (dense && v.kind !== 'seed' && deg < 5) g.classList.add('dense-hidden-label');
+    g.dataset.id = v.id;
+    g.setAttribute('role', 'button');
+    g.setAttribute('tabindex', '0');
+    g.setAttribute('aria-label', `${nodeKindText(v.kind)} ${v.label || v.id}，${deg} 个直接关联`);
+
+    const circle = document.createElementNS(NS, 'circle');
+    circle.setAttribute('r', String(radius));
+    g.append(circle);
+
+    const label = document.createElementNS(NS, 'text');
+    label.setAttribute('y', String(radius + 16));
+    label.setAttribute('text-anchor', 'middle');
+    label.textContent = shortText(v.label || v.id, v.kind === 'entry' || v.kind === 'source' ? 18 : 24);
+    g.append(label);
+
+    const title = document.createElementNS(NS, 'title');
+    title.textContent = `${nodeKindText(v.kind)} · ${v.label || v.id}\n直接关联 ${deg} 个`;
+    g.append(title);
+
+    g.addEventListener('click', ev => {
+      if (suppressClick) { suppressClick = false; return; }
+      ev.stopPropagation();
+      openDetail(v);
+      highlight(v.id);
+    });
+    g.addEventListener('dblclick', ev => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      expandNode(v);
+    });
+    g.addEventListener('pointerdown', ev => {
+      if (ev.button !== 0) return;
+      ev.stopPropagation();
+      const rect = svg.getBoundingClientRect();
+      nodeDrag = {
+        id: v.id,
+        node: v,
+        startX: (-pan.x + (ev.clientX - rect.left)) / zoom,
+        startY: (-pan.y + (ev.clientY - rect.top)) / zoom,
+        moved: false
+      };
+      v.fx = v.x;
+      v.fy = v.y;
+      simulation.alphaTarget(0.36).restart();
+      g.setPointerCapture(ev.pointerId);
+    });
+    g.addEventListener('pointermove', ev => {
+      if (!nodeDrag || nodeDrag.id !== v.id) return;
+      const rect = svg.getBoundingClientRect();
+      const wx = (-pan.x + (ev.clientX - rect.left)) / zoom;
+      const wy = (-pan.y + (ev.clientY - rect.top)) / zoom;
+      const dx = wx - nodeDrag.startX;
+      const dy = wy - nodeDrag.startY;
+      if (!nodeDrag.moved && (Math.abs(dx) > 4 || Math.abs(dy) > 4)) {
+        nodeDrag.moved = true;
+        // Previously dragged neighbors have fixed coordinates, so link forces cannot move them.
+        // Release only direct neighbors when an actual drag starts; their motion stays physical.
+        const neighborIds = new Set();
+        simulationLinks.forEach(link => {
+          if (link.sourceId === v.id) neighborIds.add(link.targetId);
+          if (link.targetId === v.id) neighborIds.add(link.sourceId);
+        });
+        simulationNodes.forEach(node => {
+          if (!neighborIds.has(node.id)) return;
+          node.fx = null;
+          node.fy = null;
+          pinned.delete(node.id);
+        });
+        simulation.alpha(Math.max(simulation.alpha(), 0.55)).restart();
+      }
+      if (nodeDrag.moved) {
+        v.fx += dx;
+        v.fy += dy;
+        v.x = v.fx;
+        v.y = v.fy;
+        renderPositions();
+        nodeDrag.startX = wx;
+        nodeDrag.startY = wy;
+      }
+    });
+    g.addEventListener('pointerup', () => {
+      if (!nodeDrag || nodeDrag.id !== v.id) return;
+      if (nodeDrag.moved) {
+        // Release the dragged node so stretched links can spring back and settle.
+        pinned.delete(v.id);
+        v.fx = null;
+        v.fy = null;
+        simulation.alpha(Math.max(simulation.alpha(), 0.48)).restart();
+        savePinned();
+        suppressClick = true;
+        setTimeout(() => { suppressClick = false; }, 350);
+      } else if (!pinned.has(v.id)) {
+        v.fx = null;
+        v.fy = null;
+      }
+      nodeDrag = null;
+      simulation.alphaTarget(0);
+    });
+    g.addEventListener('pointercancel', () => {
+      if (pinned.has(v.id)) {
+        const fixed = pinned.get(v.id);
+        v.fx = fixed.x; v.fy = fixed.y;
+      } else {
+        v.fx = null; v.fy = null;
+      }
+      nodeDrag = null;
+      simulation.alphaTarget(0);
+    });
+    g.addEventListener('contextmenu', ev => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      showMenu(ev.clientX, ev.clientY, v);
+    });
+    g.addEventListener('mouseenter', () => highlight(v.id));
+    g.addEventListener('mouseleave', () => highlight(null));
+    g.addEventListener('keydown', ev => {
+      if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); openDetail(v); }
+    });
+    svg.append(g);
+    nodeElements.set(v.id, g);
+  });
+
+  function renderPositions() {
+    simulationNodes.forEach(node => {
+      positions.set(node.id, {x: node.x, y: node.y});
+      const element = nodeElements.get(node.id);
+      if (element) element.setAttribute('transform', `translate(${node.x},${node.y})`);
+    });
+    edgeElements.forEach(({link, element}) => {
+      const source = typeof link.source === 'object' ? link.source : nodeById.get(link.source);
+      const target = typeof link.target === 'object' ? link.target : nodeById.get(link.target);
+      if (!source || !target) return;
+      element.setAttribute('x1', source.x);
+      element.setAttribute('y1', source.y);
+      element.setAttribute('x2', target.x);
+      element.setAttribute('y2', target.y);
+    });
+  }
+
+  simulation = window.d3.forceSimulation(simulationNodes)
+    .force('link', window.d3.forceLink(simulationLinks).id(d => d.id)
+      .distance(e => e.kind === 'hierarchy' ? 82 : 118)
+      .strength(e => e.kind === 'hierarchy' ? 0.9 : Math.min(0.85, 0.42 + Math.log2(Math.max(1, e.weight || 1)) * 0.1)))
+    .force('charge', window.d3.forceManyBody()
+      .strength(d => -Math.min(430, 230 + (degree.get(d.id) || 0) * 7))
+      .distanceMax(Math.max(w, h) * 0.8))
+    .force('collision', window.d3.forceCollide()
+      .radius(d => Math.min(34, 9 + Math.sqrt(degree.get(d.id) || 0) * 4) + 14)
+      .iterations(2))
+    .force('center', window.d3.forceCenter(cx, cy).strength(0.08))
+    .force('x', window.d3.forceX(cx).strength(0.025))
+    .force('y', window.d3.forceY(cy).strength(0.025))
+    .alpha(1)
+    .alphaDecay(0.035)
+    .velocityDecay(0.32)
+    .on('tick', renderPositions);
+
+  renderPositions();
+  applyZoom();
+  project();
+  if (hover) highlight(hover);
+}
+function highlight(id) {
+  hover = id;
+  const related = new Set([id]);
+  data.edges.forEach(e => {
+    if (e.source === id) related.add(e.target);
+    if (e.target === id) related.add(e.source);
+  });
+  svg.querySelectorAll('.node').forEach(g => {
+    const hit = !id || related.has(g.dataset.id);
+    g.classList.toggle('dim', !hit);
+    g.classList.toggle('hot', g.dataset.id === id);
+  });
+  svg.querySelectorAll('.edge').forEach(l => l.classList.toggle('active', !!id && (l.dataset.a === id || l.dataset.b === id)));
+  if (!id) { clearNeighbors(); return; }
+  const neighbors = [...related].filter(x => x !== id);
+  const box = $('neighbors');
+  box.replaceChildren();
+  const p = document.createElement('p');
+  p.className = 'muted';
+  p.textContent = '直接关系';
+  box.append(p);
+  neighbors.forEach(nid => {
+    const span = document.createElement('span');
+    span.className = 'badge';
+    span.textContent = shortText(labelOf(nid), 28);
+    box.append(span, document.createTextNode(' '));
+  });
+}
+
+function openDetail(v) {
+  selected = v;
+  const deg = data.edges.filter(e => e.source === v.id || e.target === v.id).length;
+  $('detailTitle').textContent = shortText(v.label || v.id, 80);
+  if (v.kind === 'entry') {
+    const parts = [v.date || '记忆条目', shortText(v.summary || '', 420)];
+    if (v.source) parts.push('来源 ' + shortText(v.source, 240));
+    $('detail').textContent = parts.filter(Boolean).join(' · ');
+  } else if (v.kind === 'source') {
+    $('detail').textContent = '来源文件 · ' + shortText(v.source || v.label || '', 300);
+  } else {
+    $('detail').textContent = `关系图节点 · ${deg} 个直接关联 · 来源：记忆索引共现统计（不代表因果）`;
+  }
+  const es = data.edges.filter(e => e.source === v.id || e.target === v.id);
+  const box = $('neighbors');
+  box.replaceChildren();
+  if (!es.length) {
+    const p = document.createElement('p');
+    p.className = 'muted';
+    p.textContent = '暂无直接关系';
+    box.append(p);
+    return;
+  }
+  es.forEach(e => {
+    const p = document.createElement('p');
+    const badge = document.createElement('span');
+    badge.className = 'badge';
+    badge.textContent = e.type || '共现';
+    const other = e.source === v.id ? e.target : e.source;
+    p.append(badge, document.createTextNode(' ' + shortText(labelOf(other), 60) + ' '));
+    const w = document.createElement('span');
+    w.className = 'muted';
+    w.textContent = '×' + (e.weight || 1);
+    p.append(w);
+    box.append(p);
+  });
+}
+
+// 画像页的默认入口：把事实卡里真实出现过的标签列出来，点一下就看，不用先知道名字。
+const ENTITY_KIND_LABELS = {person: '人物', event: '事件／主题', object: '事物'};
+let entityState = {kind: 'person', items: [], total: 0, error: '', loading: false, loaded: false};
+// 标签列表跟着数据版本走：编辑/软删后切回画像页要重新统计，否则张数会停在旧值
+let entityRevision = -1;
+
+async function loadEntityList() {
+  if (entityState.loading) return;
+  entityState.loading = true;
+  if (activeView === 'profile' && !profileState.data) renderEntityList($('managementBody'));
+  try {
+    const response = await fetch('/entities?kind=' + encodeURIComponent(entityState.kind) + '&limit=60',
+                                 {cache: 'no-store'});
+    let payload = null;
+    try { payload = await response.json(); } catch (e) { /* keep null */ }
+    if (!response.ok || !payload || !Array.isArray(payload.items)) {
+      throw new Error((payload && payload.error) || ('HTTP ' + response.status));
+    }
+    entityState.items = payload.items;
+    entityState.total = Number(payload.total) || payload.items.length;
+    entityState.error = '';
+  } catch (e) {
+    entityState.items = [];
+    entityState.total = 0;
+    entityState.error = e.message || '请求失败';
+  } finally {
+    entityState.loading = false;
+    entityState.loaded = true;
+    entityRevision = dataRevision;
+    if (activeView === 'profile' && !profileState.data) renderEntityList($('managementBody'));
+  }
+}
+
+function appendBackToEntityList(body) {
+  const back = document.createElement('button');
+  back.type = 'button';
+  back.className = 'table-action';
+  back.textContent = '返回标签列表';
+  back.style.marginTop = '10px';
+  back.addEventListener('click', () => {
+    profileState = {name: '', kind: 'auto', offset: 0, limit: 50, sort: 'name',
+                    usage: '', importance: '', data: null, error: ''};
+    entityState.loaded = false;
+    renderEntityList(body);
+  });
+  body.append(back);
+}
+
+function renderEntityList(body) {
+  if (entityState.loaded && entityRevision !== dataRevision) entityState.loaded = false;
+  if (!entityState.loaded && !entityState.loading) { loadEntityList(); return; }
+  body.replaceChildren();
+  $('managementStatus').textContent = entityState.loaded
+    ? `按事实卡自动识别：${entityState.total} 个${ENTITY_KIND_LABELS[entityState.kind] || '标签'}`
+    : '正在读取可用标签…';
+  const section = document.createElement('section');
+  section.className = 'profile-summary';
+  const heading = document.createElement('h3');
+  heading.textContent = '直接点一个标签看画像';
+  section.append(heading);
+  const note = document.createElement('div');
+  note.className = 'muted';
+  note.textContent = '列表来自现有事实卡的 people／topics／things 标签（不含已软删的卡）。也要精确查找时用上方搜索框。';
+  section.append(note);
+
+  const tabs = document.createElement('div');
+  tabs.className = 'profile-toolbar';
+  Object.keys(ENTITY_KIND_LABELS).forEach(kind => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'table-action';
+    button.textContent = ENTITY_KIND_LABELS[kind];
+    button.setAttribute('aria-current', entityState.kind === kind ? 'true' : 'false');
+    button.disabled = entityState.loading && entityState.kind !== kind;
+    button.addEventListener('click', () => {
+      if (entityState.kind === kind && entityState.loaded) return;
+      entityState.kind = kind;
+      entityState.items = [];
+      entityState.total = 0;
+      entityState.error = '';
+      entityState.loaded = false;
+      if ($('profileKind')) $('profileKind').value = kind;
+      renderEntityList($('managementBody'));
+    });
+    tabs.append(button);
+  });
+  section.append(tabs);
+
+  const box = document.createElement('div');
+  box.className = 'profile-related';
+  if (entityState.loading && !entityState.items.length) {
+    box.textContent = '正在读取可用标签…';
+  } else if (entityState.error) {
+    box.textContent = '读取失败：' + entityState.error + '。';
+    const retry = document.createElement('button');
+    retry.type = 'button';
+    retry.className = 'table-action';
+    retry.textContent = '重试';
+    retry.addEventListener('click', () => { entityState.loaded = false; renderEntityList($('managementBody')); });
+    box.append(retry);
+  } else if (!entityState.items.length) {
+    box.textContent = '还没有可用的事实卡标签。先构建索引，或先写几张事实卡。';
+  } else {
+    entityState.items.forEach(item => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = `${item.name}（${item.count}）`;
+      button.title = `打开${ENTITY_KIND_LABELS[entityState.kind] || '标签'}画像`;
+      button.addEventListener('click', () => {
+        if ($('profileQuery')) $('profileQuery').value = item.name;
+        loadProfile(item.name, entityState.kind);
+      });
+      box.append(button);
+    });
+  }
+  section.append(box);
+  body.append(section);
+}
+
+function profileQueryOptions() {
+  return {
+    sort: $('profileSort') ? $('profileSort').value : 'name',
+    usage: $('profileUsage') ? $('profileUsage').value : '',
+    importance: $('profileImportance') ? $('profileImportance').value : ''
+  };
+}
+
+async function loadProfile(name, kind = 'auto', offset = 0, options = null) {
+  const cleanName = String(name || '').trim();
+  if (!cleanName) {
+    profileState.error = '请输入一个标签名称。';
+    profileState.data = null;
+    profileState.name = '';
+    profileState.offset = 0;
+    renderProfile();
+    return;
+  }
+  const request = ++profileRequest;
+  const profileOptions = Object.assign(profileQueryOptions(), options || {});
+  profileState = {name: cleanName, kind, offset, limit: 50, ...profileOptions, data: null, error: ''};
+  $('profileQuery').value = cleanName;
+  $('profileKind').value = kind;
+  if ($('profileSort')) $('profileSort').value = profileOptions.sort;
+  if ($('profileUsage')) $('profileUsage').value = profileOptions.usage;
+  if ($('profileImportance')) $('profileImportance').value = profileOptions.importance;
+  $('managementStatus').textContent = '正在读取画像…';
+  $('managementBody').replaceChildren();
+  const pending = document.createElement('div');
+  pending.className = 'management-empty';
+  pending.textContent = '正在从只读事实卡索引生成画像…';
+  $('managementBody').append(pending);
+  $('previousFactsBtn').disabled = true;
+  $('nextFactsBtn').disabled = true;
+  const params = new URLSearchParams({name: cleanName, kind, offset: String(offset), limit: '50', ...profileOptions});
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch('/profile?' + params.toString(), {cache: 'no-store', signal: controller.signal});
+    let payload = null;
+    try { payload = await response.json(); } catch (e) { /* keep null */ }
+    if (!response.ok) throw new Error((payload && payload.error) || ('HTTP ' + response.status));
+    if (!payload || !payload.entity || !Array.isArray(payload.items) || !Array.isArray(payload.relations)) {
+      throw new Error('画像接口返回的数据格式不正确');
+    }
+    if (request !== profileRequest) return;
+    profileState.data = payload;
+    profileState.offset = Number(payload.offset) || 0;
+    if (activeView === 'profile') renderProfile();
+  } catch (e) {
+    if (request !== profileRequest) return;
+    profileState.error = e && e.name === 'AbortError' ? '请求超时' : (e.message || '请求失败');
+    profileState.data = null;
+    if (activeView === 'profile') renderProfile();
+  } finally {
+    clearTimeout(timer);
+    if (request === profileRequest && activeView === 'profile') {
+      const p = profileState.data;
+      $('previousFactsBtn').disabled = !p || profileState.offset <= 0 || !!profileState.error;
+      $('nextFactsBtn').disabled = !p || !p.has_more || !!profileState.error;
+    }
+  }
+}
+
+function openProfile(name, kind = 'auto') {
+  if (!name) return;
+  setView('profile');
+  loadProfile(name, kind, 0);
+}
+
+function profileKindLabel(kind) {
+  return kind === 'person' ? '人物' : kind === 'event' ? '事／主题' : kind === 'object' ? '事物' : '实体';
+}
+
+function renderProfileGraph(container, entity, relations) {
+  if (profileSimulation) { profileSimulation.stop(); profileSimulation = null; }
+  const width = Math.max(340, Math.min(760, container.clientWidth || 620));
+  const height = 260;
+  const svgEl = document.createElementNS(NS, 'svg');
+  svgEl.setAttribute('class', 'profile-graph');
+  svgEl.setAttribute('viewBox', `0 0 ${width} ${height}`);
+  svgEl.setAttribute('role', 'img');
+  svgEl.setAttribute('aria-label', `${entity.name} 的标签共现关系图`);
+  container.append(svgEl);
+  if (!window.d3 || !relations.length) {
+    const p = document.createElement('p');
+    p.className = 'muted';
+    p.textContent = relations.length ? '关系图暂不可用。' : '没有其他标签共现关系。';
+    container.append(p);
+    return;
+  }
+  const center = {id: 'center', name: entity.name, kind: entity.kind, center: true};
+  const graphRelations = relations.slice(0, 30);
+  const nodes = [center, ...graphRelations.map((item, index) => ({
+    id: `${item.kind}:${item.name}:${index}`, name: item.name, kind: item.kind,
+    count: item.evidence_count, isEntity: true
+  }))];
+  const links = nodes.slice(1).map(node => ({source: center.id, target: node.id, weight: node.count}));
+  const gLinks = window.d3.select(svgEl).append('g').selectAll('line').data(links).join('line').attr('class', 'profile-edge');
+  const gNodes = window.d3.select(svgEl).append('g').selectAll('g').data(nodes).join('g')
+    .attr('class', node => 'profile-link' + (node.center ? ' center' : ''))
+    .attr('role', node => node.center ? 'img' : 'button')
+    .attr('tabindex', node => node.center ? -1 : 0)
+    .attr('aria-label', node => node.center ? node.name : `${profileKindLabel(node.kind)}：${node.name}，共现于 ${node.count} 张事实卡`)
+    .style('cursor', node => node.center ? 'default' : 'pointer');
+  gNodes.append('circle').attr('r', node => node.center ? 24 : Math.min(19, 10 + Math.sqrt(node.count || 1)));
+  gNodes.append('text').attr('text-anchor', 'middle').attr('y', node => node.center ? 43 : 34)
+    .text(node => shortText(node.name, 20));
+  gNodes.append('title').text(node => node.center ? node.name : `${node.name} · ${node.count} 张卡片共现`);
+  gNodes.on('click', (ev, node) => { if (!node.center) openProfile(node.name, node.kind); })
+    .on('keydown', (ev, node) => { if (!node.center && (ev.key === 'Enter' || ev.key === ' ')) { ev.preventDefault(); openProfile(node.name, node.kind); } });
+  profileSimulation = window.d3.forceSimulation(nodes)
+    .force('link', window.d3.forceLink(links).id(node => node.id).distance(link => link.target.center ? 0 : 95).strength(0.75))
+    .force('charge', window.d3.forceManyBody().strength(-110))
+    .force('collision', window.d3.forceCollide().radius(node => node.center ? 44 : 42))
+    .force('center', window.d3.forceCenter(width / 2, height / 2))
+    .force('x', window.d3.forceX(node => node.center ? width / 2 : (width / 2) + Math.cos(nodes.indexOf(node) * 2.4) * 135).strength(0.18))
+    .force('y', window.d3.forceY(node => node.center ? height / 2 : (height / 2) + Math.sin(nodes.indexOf(node) * 2.4) * 85).strength(0.18))
+    .on('tick', () => {
+      gLinks.attr('x1', link => link.source.x).attr('y1', link => link.source.y)
+        .attr('x2', link => link.target.x).attr('y2', link => link.target.y);
+      gNodes.attr('transform', node => `translate(${node.x},${node.y})`);
+    });
+}
+
+async function loadImpression(name, target) {
+  try {
+    const res = await fetch('/impression?name=' + encodeURIComponent(name || ''));
+    const data = await res.json();
+    if (!res.ok) {
+      target.textContent = `印象不可用：${data.error || res.status}`;
+      target.className = 'muted';
+      return;
+    }
+    if (data.cached) {
+      target.textContent = data.impression || '';
+      target.className = '';
+    } else if (data.needs_generation) {
+      target.textContent = '暂无印象。可在对话中让 AI 调用 mem_impression 生成，生成后会缓存在这里。';
+      target.className = 'muted';
+    } else {
+      target.textContent = data.reason || '该人物暂无有效事实卡，无法生成印象。';
+      target.className = 'muted';
+    }
+  } catch (err) {
+    target.textContent = `印象加载失败：${err.message}`;
+    target.className = 'muted';
+  }
+}
+
+function renderProfile() {
+  const body = $('managementBody');
+  body.replaceChildren();
+  $('factsPageStatus').textContent = profileState.error ? '画像不可用' : (profileState.data ? `${profileState.offset + 1}–${Math.min(profileState.offset + profileState.data.items.length, profileState.data.total)} / ${profileState.data.total} 张关联事实卡` : '尚未载入');
+  $('previousFactsBtn').disabled = !profileState.data || profileState.offset <= 0 || !!profileState.error;
+  $('nextFactsBtn').disabled = !profileState.data || !profileState.data.has_more || !!profileState.error;
+  if (profileState.error) {
+    $('managementStatus').textContent = '读取失败';
+    const error = document.createElement('div'); error.className = 'management-empty';
+    error.textContent = `无法加载画像：${profileState.error}`; body.append(error);
+    appendBackToEntityList(body);
+    return;
+  }
+  const payload = profileState.data;
+  if (!payload) { renderEntityList(body); return; }
+  const entity = payload.entity || {};
+  $('managementStatus').textContent = payload.found ? `${payload.total} 张关联事实卡 · 只读画像` : '没有匹配标签';
+  if (payload.requires_kind) {
+    const choice = document.createElement('div'); choice.className = 'audit-card';
+    const title = document.createElement('strong'); title.textContent = `“${entity.name}”同时出现在多个标签类别中，请选择类别。`; choice.append(title);
+    (payload.available_kinds || []).forEach(kind => {
+      const button = document.createElement('button'); button.type = 'button'; button.className = 'table-action';
+      button.textContent = profileKindLabel(kind); button.style.marginRight = '6px'; button.addEventListener('click', () => loadProfile(entity.name, kind, 0)); choice.append(button);
+    });
+    body.append(choice); return;
+  }
+  if (!payload.found) {
+    const empty = document.createElement('div'); empty.className = 'management-empty';
+    empty.textContent = `没有找到“${entity.name || profileState.name}”的有效事实卡标签。请检查标签名称或类别。`;
+    body.append(empty); appendBackToEntityList(body); return;
+  }
+  const overview = document.createElement('div'); overview.className = 'profile-overview';
+  const summary = document.createElement('section'); summary.className = 'profile-summary';
+  const h = document.createElement('h3'); h.textContent = entity.name || profileState.name; summary.append(h);
+  const kindLine = document.createElement('div'); kindLine.className = 'muted';
+  kindLine.textContent = `${profileKindLabel(entity.kind)} · ${payload.total} 张有效事实卡 · 依据：精确匹配事实卡标签`;
+  summary.append(kindLine);
+  const impressionBox = document.createElement('div');
+  impressionBox.className = 'profile-impression';
+  const impressionTitle = document.createElement('h3');
+  impressionTitle.textContent = '人物印象';
+  const impressionText = document.createElement('p');
+  impressionText.className = 'muted';
+  impressionText.textContent = '加载中…';
+  const impressionRefresh = document.createElement('button');
+  impressionRefresh.type = 'button';
+  impressionRefresh.textContent = '刷新印象';
+  impressionRefresh.title = '标记为过期：下次 AI 调用 mem_impression 时重新生成';
+  impressionBox.append(impressionTitle, impressionText, impressionRefresh);
+  summary.append(impressionBox);
+  const impressionName = entity.name || profileState.name;
+  loadImpression(impressionName, impressionText);
+  impressionRefresh.addEventListener('click', async () => {
+    try {
+      const res = await fetch('/impression/refresh?name=' + encodeURIComponent(impressionName), { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        impressionText.textContent = `刷新失败：${data.error || res.status}`;
+      } else {
+        impressionText.textContent = '已标记过期：下次 AI 调用 mem_impression 时重新生成。';
+      }
+      impressionText.className = 'muted';
+    } catch (err) {
+      impressionText.textContent = `刷新失败：${err.message}`;
+      impressionText.className = 'muted';
+    }
+  });
+  const relationPanel = document.createElement('section'); relationPanel.className = 'profile-relations';
+  const relationTitle = document.createElement('h3'); relationTitle.textContent = `标签关联图 · ${payload.relations.length} 个关联实体`;
+  relationPanel.append(relationTitle);
+  const caveat = document.createElement('p'); caveat.className = 'muted';
+  caveat.textContent = '连线表示两个标签出现在同一事实卡，不代表因果关系或身份相同。点击节点可打开对应画像。';
+  relationPanel.append(caveat);
+  const graph = document.createElement('div'); relationPanel.append(graph);
+  summary.append(Object.assign(document.createElement('p'), {className: 'muted', textContent: payload.text || ''}));
+  overview.append(summary, relationPanel); body.append(overview);
+  renderProfileGraph(graph, entity, payload.relations || []);
+  if (payload.relations.length > 30) {
+    const more = document.createElement('p'); more.className = 'muted';
+    more.textContent = `图中显示前 30 个关联标签；下方列表可访问全部 ${payload.relations.length} 个。`;
+    relationPanel.append(more);
+  }
+  const relationList = document.createElement('div'); relationList.className = 'profile-actions';
+  (payload.relations || []).forEach(item => {
+    const button = document.createElement('button'); button.type = 'button';
+    button.textContent = `${profileKindLabel(item.kind)}：${item.name} · ${item.evidence_count} 卡`;
+    button.title = '打开该标签的画像'; button.addEventListener('click', () => openProfile(item.name, item.kind)); relationList.append(button);
+  });
+  const relationHeading = document.createElement('h3'); relationHeading.className = 'profile-subtitle'; relationHeading.textContent = '关联标签';
+  body.append(relationHeading, relationList);
+  const factsHeading = document.createElement('h3'); factsHeading.className = 'profile-subtitle'; factsHeading.textContent = '关联事实卡'; body.append(factsHeading);
+  const note = document.createElement('p'); note.className = 'muted profile-note';
+  note.textContent = '下列事实卡提供来源、摘要、重要度和调用统计。可用上方排序／筛选定位条目；单击行或“查看详情”查看条目，右键可跳转到审计候选执行修改／合并或软删。'; body.append(note);
+  const facts = payload.items || [];
+  if (!facts.length) { const empty = document.createElement('div'); empty.className = 'management-empty'; empty.textContent = '没有可显示的关联事实卡。'; body.append(empty); return; }
+  const wrap = document.createElement('div'); wrap.style.overflow = 'auto';
+  const table = document.createElement('table'); table.className = 'fact-table';
+  const thead = document.createElement('thead'); thead.innerHTML = '<tr><th>事实卡</th><th>出处</th><th>关联标签</th><th>重要度</th><th>已确认调用</th><th>近 7 日</th><th>统计覆盖</th><th>最后调用</th><th>操作</th></tr>'; table.append(thead);
+  const tbody = document.createElement('tbody');
+  facts.forEach(fact => {
+    const row = document.createElement('tr');
+    row.classList.add('profile-fact-row');
+    row.tabIndex = 0;
+    row.title = '单击查看详情；右键打开操作栏';
+    const title = fact.head || fact.summary || fact.id || '未命名事实卡';
+    const titleCell = factCell(row, title, 'fact-name profile-fact');
+    const summaryText = document.createElement('div'); summaryText.className = 'muted'; summaryText.textContent = shortText(fact.summary || '', 260); titleCell.append(summaryText);
+    if (fact.excerpt) {
+      const detail = document.createElement('details'); detail.style.marginTop = '6px';
+      const toggle = document.createElement('summary'); toggle.className = 'muted'; toggle.textContent = '展开事实依据'; detail.append(toggle);
+      const excerpt = document.createElement('div'); excerpt.className = 'muted'; excerpt.style.whiteSpace = 'pre-wrap'; excerpt.style.marginTop = '5px';
+      excerpt.textContent = fact.excerpt + (fact.excerpt_truncated ? '\n（内容过长，已截取前 1600 字符）' : ''); detail.append(excerpt); titleCell.append(detail);
+    }
+    factCell(row, fact.source || '无可用出处', 'fact-source');
+    const related = document.createElement('td'); const relatedBox = document.createElement('div'); relatedBox.className = 'profile-related';
+    (fact.related_entities || []).forEach(item => {
+      const button = document.createElement('button'); button.type = 'button'; button.textContent = `${profileKindLabel(item.kind)}：${item.name}`;
+      button.addEventListener('click', () => openProfile(item.name, item.kind)); relatedBox.append(button);
+    }); related.append(relatedBox); row.append(related);
+    factCell(row, fact.importance == null ? '未设置' : `${fact.importance}（${fact.importance_source || '来源未知'}）`, '');
+    const statsAvailable = fact.statistics_available === true;
+    factCell(row, statsAvailable ? fact.call_count : '统计不可用', '');
+    const recent = statsAvailable ? (fact.statistics_complete ? fact.calls_7d : `${fact.calls_7d_observed || 0}（已观察）`) : '统计不可用';
+    factCell(row, recent == null ? '统计不完整' : recent, '');
+    const coverage = !statsAvailable ? '统计不可用' : fact.statistics_complete ? '完整 7 日' : `统计不完整 · 起点 ${fact.statistics_start_time ? formatHongKongTime(fact.statistics_start_time) : '未知'}`;
+    factCell(row, coverage, '');
+    const last = statsAvailable ? formatHongKongTime(fact.last_called_at) : '';
+    factCell(row, !statsAvailable ? '统计不可用' : (last ? `${last}（${fact.last_called_channel || '入口未知'}）` : '统计范围内暂无调用'), '');
+    const action = document.createElement('td'); const locate = document.createElement('button'); locate.type = 'button'; locate.className = 'table-action'; locate.textContent = '在图谱中定位';
+    locate.addEventListener('click', async () => {
+      setView('graph'); $('query').value = title;
+      await load(title, false, '', true);
+      const graphNode = data.nodes.find(node => node.kind === 'entry' && (node.id === 'entry:' + String(fact.id || '') || node.label === title));
+      if (graphNode) { openDetail(graphNode); highlight(graphNode.id); }
+      else setStatus(`已按“${shortText(title, 42)}”搜索图谱，当前索引中没有对应事实卡节点。`);
+    });
+    const detail = document.createElement('button'); detail.type = 'button'; detail.className = 'table-action'; detail.textContent = '查看详情';
+    detail.addEventListener('click', () => {
+      const graphId = 'entry:' + String(fact.id || '');
+      const graphFact = data.nodes.find(node => node.id === graphId) || {
+        id: graphId, kind: 'entry', label: title, source: fact.source || '',
+        date: fact.date || '', summary: fact.summary || ''
+      };
+      setView('graph'); openDetail(graphFact);
+      if (data.nodes.some(node => node.id === graphId)) highlight(graphId);
+    });
+    action.append(locate, detail); row.append(action);
+    const openRowDetail = () => detail.click();
+    row.addEventListener('click', e => { if (!e.target.closest('button, a, details, summary')) openRowDetail(); });
+    row.addEventListener('keydown', e => { if ((e.key === 'Enter' || e.key === ' ') && !e.target.closest('button')) { e.preventDefault(); openRowDetail(); } });
+    row.addEventListener('contextmenu', e => {
+      e.preventDefault();
+      selected = {kind: 'entry', id: 'entry:' + String(fact.id || ''), label: title, source: fact.source || '', factId: String(fact.id || ''), factVersion: String(fact.version || ''), factBody: String(fact.excerpt || ''), factBodyTruncated: !!fact.excerpt_truncated};
+      showProfileFactMenu(e.clientX, e.clientY, selected);
+    });
+    tbody.append(row);
+  });
+  table.append(tbody); wrap.append(table); body.append(wrap);
+}
+
+function showMenu(x, y, v) {
+  selected = v;
+  profileFactMenu = false;
+  const m = $('context');
+  m.style.display = 'block';
+  m.hidden = false;
+  m.style.left = '0px';
+  m.style.top = '0px';
+  const w = m.offsetWidth, h = m.offsetHeight;
+  m.style.left = Math.max(8, Math.min(x, window.innerWidth - w - 8)) + 'px';
+  m.style.top = Math.max(8, Math.min(y, window.innerHeight - h - 8)) + 'px';
+  const hasNode = !!v;
+  m.querySelectorAll('[data-node-only]').forEach(el => { el.hidden = !hasNode; });
+  m.querySelectorAll('[data-profile-fact-only]').forEach(el => { el.hidden = true; });
+  const copySource = m.querySelector('[data-action="copy-source"]');
+  if (copySource) copySource.hidden = !hasNode || !(v.source || v.kind === 'source');
+  const profileAction = m.querySelector('[data-action="profile"]');
+  if (profileAction) profileAction.hidden = !hasNode || !(v.kind === 'seed' || v.kind === 'neighbor');
+}
+
+function showProfileFactMenu(x, y, fact) {
+  showMenu(x, y, fact);
+  profileFactMenu = true;
+  const m = $('context');
+  m.querySelectorAll('[data-node-only]').forEach(el => { el.hidden = true; });
+  m.querySelectorAll('[data-profile-fact-only]').forEach(el => { el.hidden = false; });
+  m.querySelector('[data-action="open"]').hidden = false;
+  m.style.display = 'block';
+}
+
+let activeView = 'graph';
+function setView(view) {
+  activeView = view;
+  if (view !== 'profile' && profileSimulation) { profileSimulation.stop(); profileSimulation = null; }
+  const graphVisible = view === 'graph';
+  document.querySelector('.workspace').hidden = !graphVisible;
+  $('management').hidden = graphVisible;
+  $('factsPagination').hidden = graphVisible || view === 'audit';
+  $('graphViewBtn').setAttribute('aria-current', graphVisible ? 'page' : 'false');
+  $('managementViewBtn').setAttribute('aria-current', view === 'management' ? 'page' : 'false');
+  $('profileViewBtn').setAttribute('aria-current', view === 'profile' ? 'page' : 'false');
+  $('auditViewBtn').setAttribute('aria-current', view === 'audit' ? 'page' : 'false');
+  $('profileToolbar').hidden = view !== 'profile';
+  $('auditToolbar').hidden = view !== 'audit';
+  if (view === 'management') {
+    $('managementTitle').textContent = '事实卡管理';
+    $('managementDescription').textContent = '浏览有效事实卡、关联实体、出处及已确认调用统计。页面查看、候选命中和失败请求不计为调用。';
+    $('managementToolbar').hidden = false;
+    if (profileSimulation) { profileSimulation.stop(); profileSimulation = null; }
+    $('factsPagination').hidden = false;
+    if (managementLoaded) renderManagement();
+    else loadManagementFacts(0);
+  } else if (view === 'profile') {
+    $('managementTitle').textContent = '人／事／物画像';
+    $('managementDescription').textContent = '按事实卡 people／topics／things 标签构建只读画像；主题标签按“事／主题”展示。连线表示同一事实卡中的标签共现，不代表身份或因果关系。';
+    $('managementToolbar').hidden = true;
+    $('factsPagination').hidden = false;
+    if (profileState.data || profileState.error) renderProfile();
+    else renderEntityList($('managementBody'));
+  } else if (view === 'audit') {
+    $('managementTitle').textContent = '审计';
+    $('managementDescription').textContent = '高置信重复会先自动合并；低置信重复、冲突和新提案留在这里人工确认。可查看自动／人工操作记录并撤回合并或软删。';
+    $('managementToolbar').hidden = true;
+    if (profileSimulation) { profileSimulation.stop(); profileSimulation = null; }
+    $('factsPagination').hidden = true;
+    if (auditLoaded && auditRevision === dataRevision) renderAudit();
+    else loadAudit();
+  } else if (view === 'graph') {
+    // 回到图谱：数据被改过（编辑/软删/审计）或还没载入过，按上次的条件重取；
+    // 否则按原样重绘，不动用户已经摆好的布局。
+    if (graphLoadedRevision !== dataRevision || !data.nodes.length) load(lastGraphQuery, lastGraphAll);
+    else draw();
+  }
+}
+
+async function loadManagementFacts(offset = 0) {
+  const request = ++managementRequest;
+  managementOffset = Math.max(0, offset);
+  managementError = '';
+  $('managementStatus').textContent = '正在读取事实卡…';
+  $('previousFactsBtn').disabled = true;
+  $('nextFactsBtn').disabled = true;
+  const body = $('managementBody');
+  body.replaceChildren();
+  const pending = document.createElement('div');
+  pending.className = 'management-empty';
+  pending.textContent = '正在从只读事实卡接口加载数据…';
+  body.append(pending);
+  const params = new URLSearchParams({
+    query: ($('factQuery').value || '').trim(),
+    offset: String(managementOffset),
+    limit: String(MANAGEMENT_PAGE_SIZE),
+    sort: $('factSort').value,
+    usage: $('usageFilter').value,
+    importance: $('importanceFilter').value
+  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch('/facts?' + params.toString(), {
+      cache: 'no-store', signal: controller.signal
+    });
+    let payload = null;
+    try { payload = await response.json(); } catch (e) { /* keep null */ }
+    if (!response.ok) throw new Error((payload && payload.error) || ('HTTP ' + response.status));
+    if (!payload || !Array.isArray(payload.items) || !Number.isFinite(Number(payload.total))) {
+      throw new Error('事实卡接口返回的数据格式不正确');
+    }
+    if (request !== managementRequest) return;
+    managementFacts = payload.items;
+    managementTotal = Math.max(0, Number(payload.total));
+    managementOffset = Math.max(0, Number(payload.offset) || 0);
+    managementLoaded = true;
+    renderManagement();
+  } catch (e) {
+    if (request !== managementRequest) return;
+    managementError = e && e.name === 'AbortError' ? '请求超时' : (e.message || '请求失败');
+    managementLoaded = false;
+    managementFacts = [];
+    managementTotal = 0;
+    renderManagement();
+  } finally {
+    clearTimeout(timer);
+    if (request === managementRequest) {
+      $('previousFactsBtn').disabled = managementOffset <= 0 || !!managementError;
+      $('nextFactsBtn').disabled = managementOffset + managementFacts.length >= managementTotal || !!managementError;
+    }
+  }
+}
+
+function factCell(row, text, className) {
+  const td = document.createElement('td');
+  if (className) td.className = className;
+  td.textContent = String(text == null || text === '' ? '—' : text);
+  row.append(td);
+  return td;
+}
+
+function renderManagement() {
+  const body = $('managementBody');
+  body.replaceChildren();
+  const end = Math.min(managementOffset + managementFacts.length, managementTotal);
+  $('factsPageStatus').textContent = managementError
+    ? '数据暂不可用'
+    : (managementTotal ? `第 ${managementOffset + 1}–${end} 张，共 ${managementTotal} 张事实卡` : '共 0 张事实卡');
+  $('previousFactsBtn').disabled = managementOffset <= 0 || !!managementError;
+  $('nextFactsBtn').disabled = managementOffset + managementFacts.length >= managementTotal || !!managementError;
+  if (managementError) {
+    $('managementStatus').textContent = '读取失败';
+    const error = document.createElement('div');
+    error.className = 'management-empty';
+    error.textContent = `无法加载事实卡：${managementError}。请检查图谱服务后点击“刷新当前数据”重试。`;
+    body.append(error);
+    return;
+  }
+  const facts = managementFacts.slice();
+  $('managementStatus').textContent = `${managementTotal} 张事实卡 · 只读浏览 · 计数口径：仅计成功交付，含宿主技术重试（供观察趋势用）`;
+  if (!facts.length) {
+    const empty = document.createElement('div');
+    empty.className = 'management-empty';
+    empty.textContent = '没有符合条件的事实卡。';
+    body.append(empty);
+    return;
+  }
+  const wrap = document.createElement('div');
+  wrap.style.overflow = 'auto';
+  const table = document.createElement('table');
+  table.className = 'fact-table';
+  const head = document.createElement('thead');
+  head.innerHTML = '<tr><th>事实卡</th><th>出处</th><th>重要度</th><th>已确认调用</th><th>自动注入</th><th>工具调用</th><th>近 7 日</th><th>统计覆盖</th><th>最后调用</th><th>操作</th></tr>';
+  table.append(head);
+  const tbody = document.createElement('tbody');
+  facts.forEach(fact => {
+    const row = document.createElement('tr');
+    const title = fact.head || fact.summary || fact.id || '未命名事实卡';
+    factCell(row, title, 'fact-name');
+    factCell(row, fact.source || '无可用出处', 'fact-source');
+    const importance = fact.importance == null || fact.importance === ''
+      ? '未设置（来源未知）'
+      : `${fact.importance}（来源：${fact.importance_source || '未知'}）`;
+    factCell(row, importance, '');
+    const available = fact.statistics_available === true;
+    factCell(row, available ? fact.call_count : '统计不可用', '');
+    factCell(row, available ? fact.automatic_call_count : '统计不可用', '');
+    factCell(row, available ? fact.tool_call_count : '统计不可用', '');
+    const observed = Number(fact.calls_7d_observed || 0);
+    const complete = fact.statistics_complete === true;
+    const gaps = Number(fact.statistics_gap_count_7d || 0);
+    let recentLabel = '统计不可用';
+    if (available) {
+      recentLabel = complete
+        ? String(fact.calls_7d == null ? observed : fact.calls_7d)
+        : `${observed}（已观察）`;
+      if (gaps > 0 || fact.statistics_gap_open) recentLabel += ' · 采集不完整';
+    }
+    factCell(row, recentLabel, '');
+    const start = fact.statistics_start_time ? `起点 ${formatHongKongTime(fact.statistics_start_time)}` : '统计起点未知';
+    let coverage = '统计不可用';
+    if (available) {
+      if (complete) coverage = `完整 7 日 · ${start}`;
+      else if (gaps > 0 || fact.statistics_gap_open) coverage = `统计有缺口 · ${start}`;
+      else if (fact.statistics_start_time) coverage = `统计不足 7 日 · ${start}`;
+      else coverage = '统计起点未知，不能确认覆盖期';
+      if (gaps > 0) coverage += ` · 近 7 日缺口 ${gaps} 次`;
+      if (fact.statistics_gap_open) coverage += ' · 当前采集中断';
+    }
+    factCell(row, coverage, '');
+    const lastAt = formatHongKongTime(fact.last_called_at);
+    const channelNames = {automatic: '自动注入', memrecall: 'memrecall', memwhen: 'memwhen'};
+    const lastChannel = channelNames[fact.last_called_channel] || fact.last_called_channel;
+    factCell(row, !available ? '统计不可用' : (lastAt ? `${lastAt}（${lastChannel || '入口未知'}）` : '统计范围内暂无调用'), '');
+    const actionCell = document.createElement('td');
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'table-action';
+    button.textContent = '查看详情';
+    button.addEventListener('click', () => {
+      const graphId = 'entry:' + String(fact.id || '');
+      const graphFact = data.nodes.find(node => node.id === graphId) || {
+        id: graphId, kind: 'entry', label: title, source: fact.source || '',
+        date: fact.date || '', summary: fact.summary || ''
+      };
+      setView('graph');
+      openDetail(graphFact);
+      if (data.nodes.some(node => node.id === graphId)) highlight(graphId);
+    });
+    actionCell.append(button);
+    row.append(actionCell);
+    // 事实卡管理表也要能右键编辑/软删：用户先在这张表里找到卡，不该再让他回画像页
+    const openFactMenu = e => {
+      e.preventDefault();
+      selected = {kind: 'entry', id: 'entry:' + String(fact.id || ''), label: title,
+                  source: fact.source || '', factId: String(fact.id || ''),
+                  factVersion: String(fact.version || ''),
+                  factBody: String(fact.excerpt || ''), factBodyTruncated: !!fact.excerpt_truncated};
+      showProfileFactMenu(e.clientX, e.clientY, selected);
+    };
+    row.addEventListener('contextmenu', openFactMenu);
+    row.title = '右键可编辑正文或软删这张事实卡';
+    tbody.append(row);
+  });
+  table.append(tbody);
+  wrap.append(table);
+  body.append(wrap);
+}
+
+function formatHongKongTime(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return '时间格式不可用';
+  return new Intl.DateTimeFormat('zh-HK', {
+    timeZone: 'Asia/Hong_Kong', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+  }).format(date) + ' HKT';
+}
+
+async function loadAudit() {
+  const request = ++auditRequest;
+  auditError = '';
+  $('managementStatus').textContent = '正在执行自动审计…';
+  const body = $('managementBody');
+  body.replaceChildren();
+  const pending = document.createElement('div');
+  pending.className = 'management-empty';
+  pending.textContent = '正在合并高置信重复；低置信重复和冲突会留给人工审计…';
+  body.append(pending);
+  let controller = new AbortController();
+  let timer = setTimeout(() => controller.abort(), 30000);
+  // Automatic processing is deliberately best-effort for the UI. A failure
+  // must leave the manual audit list usable and visible.
+  try {
+    const automatic = await fetch('/audit/auto', {
+      method: 'POST', cache: 'no-store', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({limit: 20}), signal: controller.signal
+    });
+    let automaticPayload = null;
+    try { automaticPayload = await automatic.json(); } catch (e) { /* keep null */ }
+    if (!automatic.ok || !automaticPayload || automaticPayload.ok !== true) {
+      throw new Error((automaticPayload && automaticPayload.error) || ('HTTP ' + automatic.status));
+    }
+    if (automaticPayload.warning) {
+      auditNotice = `自动审计已处理 ${automaticPayload.applied || 0} 项后暂停：${automaticPayload.warning}。剩余候选仍可人工核对。`;
+    } else if (automaticPayload.applied) {
+      auditNotice = `自动审计已合并 ${automaticPayload.applied} 项高置信重复；其余候选仍需人工确认。`;
+    }
+    // 自动合并改动了有效事实：数据版本要变，否则切回图谱会看到合并前的旧图
+    if (Number(automaticPayload.applied) > 0) dataRevision += 1;
+  } catch (e) {
+    if (request === auditRequest) {
+      auditNotice = `自动审计未完成：${e && e.name === 'AbortError' ? '请求超时' : (e.message || '请求失败')}。已继续读取人工审计候选。`;
+    }
+  }
+  clearTimeout(timer);
+  controller = new AbortController();
+  timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    if (request !== auditRequest) return;
+    const response = await fetch('/audit?limit=100', {cache: 'no-store', signal: controller.signal});
+    let payload = null;
+    try { payload = await response.json(); } catch (e) { /* keep null */ }
+    if (!response.ok) throw new Error((payload && payload.error) || ('HTTP ' + response.status));
+    if (!payload || !Array.isArray(payload.issues) || !Array.isArray(payload.history)) {
+      throw new Error('审计接口返回的数据格式不正确');
+    }
+    if (request !== auditRequest) return;
+    auditIssues = payload.issues;
+    auditHistory = payload.history;
+    auditLoaded = true;
+    auditRevision = dataRevision;
+    renderAudit();
+  } catch (e) {
+    if (request !== auditRequest) return;
+    auditError = e && e.name === 'AbortError' ? '请求超时' : (e.message || '请求失败');
+    auditLoaded = false;
+    auditIssues = [];
+    auditHistory = [];
+    renderAudit();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function auditSourceText(card) {
+  const refs = Array.isArray(card.provenance) ? card.provenance : [];
+  if (refs.length) return refs.map(ref => {
+    const where = `${ref.source || card.source || '出处未知'}${ref.line_number ? '#L' + ref.line_number : ''}`;
+    const range = Number.isFinite(Number(ref.offset))
+      ? `\n输入范围偏移：${Number(ref.offset)}${Number.isFinite(Number(ref.offset_end)) ? '–' + Number(ref.offset_end) : ''}` : '';
+    const excerpt = ref.excerpt ? '\n输入片段：' + ref.excerpt : '';
+    return `${where}${range}${ref.line ? '\n' + ref.line : ''}${excerpt}`;
+  }).join('\n');
+  const where = `${card.source || card.file || '出处未知'}${card.line_number ? '#L' + card.line_number : ''}`;
+  return `${where}${card.line ? '\n' + card.line : ''}`;
+}
+
+function appendAuditFact(parent, issue, fact, index) {
+  const panel = document.createElement('section');
+  panel.className = 'audit-fact';
+  const heading = document.createElement('strong');
+  const factLabel = fact.proposal ? '待合并提案' : (issue.accept_allowed ? '待确认提案' : '原卡 ' + (index + 1));
+  heading.textContent = `${factLabel} · ${fact.who || '人物未标注'} / ${fact.topic || '主题未标注'}`;
+  panel.append(heading);
+  const content = document.createElement('p');
+  content.textContent = fact.fact || fact.line || '事实正文不可用';
+  panel.append(content);
+  const source = document.createElement('div');
+  source.className = 'audit-source';
+  source.textContent = '出处：' + auditSourceText(fact);
+  panel.append(source);
+  const version = document.createElement('div');
+  version.className = 'audit-version';
+  version.style.marginTop = '7px';
+  version.textContent = `稳定卡 ID：${fact.id || '未知'} · 正文版本：${fact.version || '未知'}`;
+  panel.append(version);
+  if (!issue.accept_allowed && !fact.proposal) {
+    const actions = document.createElement('div');
+    actions.className = 'audit-actions';
+    const softDelete = document.createElement('button');
+    softDelete.type = 'button';
+    softDelete.textContent = '确认软删此卡';
+    softDelete.disabled = auditSubmitting;
+    softDelete.addEventListener('click', () => submitAudit(issue, 'soft_delete', {card_id: String(fact.id || '')}));
+    actions.append(softDelete);
+    panel.append(actions);
+  }
+  parent.append(panel);
+}
+
+function auditActionText(action) {
+  return action === 'merge' ? '合并' : action === 'soft_delete' ? '软删' : action === 'keep' ? '保留'
+    : action === 'accept' ? '确认写入' : action === 'fact_edit' ? '直接编辑正文'
+    : action === 'fact_retire' ? '直接软删此卡' : (action || '操作');
+}
+
+function auditSourceTextShort(source) {
+  return source === 'automatic' ? '自动审计' : '人工审计';
+}
+
+function renderAuditHistory(parent) {
+  const section = document.createElement('section');
+  section.className = 'audit-history';
+  const heading = document.createElement('h3');
+  heading.textContent = `审计操作记录（${auditHistory.length}）`;
+  section.append(heading);
+  const note = document.createElement('div');
+  note.className = 'muted';
+  note.textContent = '自动合并和人工操作都会记录在这里；已应用的合并或软删可以撤回，撤回后候选会回到人工审计。';
+  section.append(note);
+  if (!auditHistory.length) {
+    const empty = document.createElement('div');
+    empty.className = 'muted';
+    empty.style.marginTop = '8px';
+    empty.textContent = '还没有审计操作记录。';
+    section.append(empty);
+  }
+  auditHistory.forEach(record => {
+    const row = document.createElement('div');
+    row.className = 'audit-history-row';
+    const main = document.createElement('div');
+    main.className = 'audit-history-main';
+    const title = document.createElement('strong');
+    title.textContent = `${record.channel === 'fact' ? '直接操作' : auditSourceTextShort(record.source)} · ${auditActionText(record.action)}`;
+    main.append(title);
+    const status = document.createElement('span');
+    status.className = 'badge';
+    status.textContent = record.status === 'undone' ? '已撤回' : '已应用';
+    main.append(status);
+    const meta = document.createElement('div');
+    meta.className = 'audit-history-meta';
+    const target = record.result_id || record.target || record.issue_id || '未标注目标';
+    meta.textContent = `${formatHongKongTime(record.created_at)} · ${record.input_count || 0} 张输入卡 · ${shortText(target, 90)}`;
+    main.append(meta);
+    row.append(main);
+    if (record.status === 'applied' && (record.action === 'merge' || record.action === 'soft_delete' || record.channel === 'fact')) {
+      const undo = document.createElement('button');
+      undo.type = 'button';
+      undo.textContent = '撤回';
+      undo.disabled = auditSubmitting;
+      undo.addEventListener('click', () => undoAudit(record));
+      row.append(undo);
+    }
+    section.append(row);
+  });
+  parent.append(section);
+}
+
+async function undoAudit(record) {
+  if (auditSubmitting || !record || !record.operation_id) return;
+  auditSubmitting = true;
+  auditNotice = `正在撤回${auditActionText(record.action)}操作…`;
+  renderAudit();
+  try {
+    const undoUrl = record.channel === 'fact' ? '/fact/undo' : '/audit/undo';
+    const undoBody = record.channel === 'fact'
+      ? {op_id: String(record.operation_id)}
+      : {operation_id: String(record.operation_id)};
+    const response = await fetch(undoUrl, {
+      method: 'POST', cache: 'no-store', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(undoBody)
+    });
+    let payload = null;
+    try { payload = await response.json(); } catch (e) { /* keep null */ }
+    if (!response.ok || !payload || payload.ok !== true) {
+      const error = new Error((payload && payload.error) || ('HTTP ' + response.status));
+      error.conflict = response.status === 409 || !!(payload && payload.conflict);
+      throw error;
+    }
+    auditNotice = payload.idempotent ? '该撤回此前已完成，没有重复修改。'
+      : (record.channel === 'fact' ? '人工操作已撤回；正文与软删状态已恢复到操作前。'
+                                   : '审计操作已撤回；候选已回到人工审计。');
+    dataRevision += 1;
+    await loadAudit();
+    await load('', true);
+  } catch (e) {
+    auditNotice = `${e.conflict ? '操作已变化，请刷新后重试' : '撤回失败'}：${e.message || '请求失败'}。`;
+    renderAudit();
+  } finally {
+    auditSubmitting = false;
+    if (activeView === 'audit') renderAudit();
+  }
+}
+
+function renderAudit() {
+  const body = $('managementBody');
+  body.replaceChildren();
+  if (auditNotice) {
+    const notice = document.createElement('div'); notice.className = 'audit-message';
+    notice.textContent = auditNotice; body.append(notice);
+  }
+  if (auditError) {
+    $('managementStatus').textContent = '读取失败';
+    const error = document.createElement('div'); error.className = 'management-empty';
+    error.textContent = `无法加载审计候选：${auditError}。点击“刷新审计候选”重试。`;
+    body.append(error); return;
+  }
+  const policy = document.createElement('div');
+  policy.className = 'audit-policy';
+  const policyTitle = document.createElement('strong');
+  policyTitle.textContent = '审计策略';
+  policy.append(policyTitle);
+  const policyText = document.createElement('div');
+  policyText.className = 'muted';
+  policyText.textContent = '高置信“重复”（相似度 ≥ 0.85）会自动合并并保留全部出处；低置信重复、可能矛盾、同名不同人和新提案继续等待人工确认。自动操作可在下方记录中撤回。';
+  policy.append(policyText);
+  body.append(policy);
+  renderAuditHistory(body);
+  $('managementStatus').textContent = `${auditIssues.length} 项候选 · ${auditHistory.length} 条操作记录`;
+  if (!auditIssues.length) {
+    const empty = document.createElement('div'); empty.className = 'management-empty';
+    empty.textContent = '当前没有待确认的新事实，也没有待处理的相似或冲突候选。'; body.append(empty); return;
+  }
+  auditIssues.forEach((issue, issueIndex) => {
+    const card = document.createElement('article'); card.className = 'audit-card';
+    const title = document.createElement('strong');
+    title.textContent = issue.proposal_conflict
+      ? `待合并提案 · ${issue.kind || '审计候选'} · 相似度 ${Number(issue.score || 0).toFixed(3)}`
+      : issue.accept_allowed ? (issue.kind || '新事实待确认') : `${issue.kind || '审计候选'} · 相似度 ${Number(issue.score || 0).toFixed(3)}`;
+    card.append(title);
+    if (issue.accept_allowed || issue.proposal_conflict) {
+      const proposalNote = document.createElement('div'); proposalNote.className = 'muted';
+      proposalNote.textContent = issue.proposal_conflict
+        ? '自动整理提案与现有事实卡达到重复或近重复阈值；请确认合并正文。提案出处仅表示本次输入范围，合并后会与原卡出处一起保留。'
+        : '这是自动整理产生的新事实提案。出处仅表示本次输入范围，逐条对应关系仍需人工核验；确认后才会写入事实卡。';
+      card.append(proposalNote);
+    }
+    const why = document.createElement('div'); why.className = 'muted';
+    why.textContent = issue.proposal_conflict
+      ? `候选依据：提案与现有事实卡的${issue.kind === '可能重复' ? '人物、主题一致且正文存在一定相似' : '正文文本相似度达到重复阈值'}。`
+      : issue.accept_allowed
+      ? '候选依据：自动整理提出的新事实，当前尚未写入事实卡。'
+      : `候选依据：${issue.kind === '可能矛盾' ? '同一人物与主题、日期相同，但否定表达不一致' : issue.kind === '可能重复' ? '人物与主题字段一致，正文存在一定相似' : '正文文本相似度达到重复阈值'}。分数用于排序提示，不代表事实已核实。`;
+    card.append(why);
+    const facts = document.createElement('div'); facts.className = 'audit-facts';
+    (issue.cards || []).forEach((fact, index) => appendAuditFact(facts, issue, fact, index));
+    card.append(facts);
+    const suggestionLabel = document.createElement('label');
+    suggestionLabel.textContent = issue.accept_allowed
+      ? '确认后写入目标事实卡；上方出处为本次输入范围，需人工核对：'
+      : issue.merge_allowed ? '拟合并正文（可编辑；出处会由系统保留）：'
+      : '拟合并正文不可用：该候选可能存在事实冲突或标签差异。';
+    suggestionLabel.className = 'muted'; card.append(suggestionLabel);
+    let suggestion = null;
+    if (issue.merge_allowed) {
+      suggestion = document.createElement('textarea'); suggestion.className = 'audit-suggestion';
+      suggestion.value = issue.suggestion || ''; suggestion.setAttribute('aria-label', '拟合并正文');
+      card.append(suggestion);
+    }
+    const actions = document.createElement('div'); actions.className = 'audit-actions';
+    if (issue.accept_allowed) {
+      const accept = document.createElement('button'); accept.type = 'button';
+      accept.textContent = '确认写入事实卡'; accept.disabled = auditSubmitting;
+      accept.addEventListener('click', () => submitAudit(issue, 'accept', {}));
+      actions.append(accept);
+    }
+    if (issue.merge_allowed) {
+      const merge = document.createElement('button'); merge.type = 'button';
+      merge.textContent = '确认合并并提交'; merge.disabled = auditSubmitting;
+      merge.addEventListener('click', () => submitAudit(issue, 'merge', {merged: suggestion.value.trim()}));
+      actions.append(merge);
+    }
+    if (!issue.accept_allowed && !issue.proposal_conflict) {
+      const keep = document.createElement('button'); keep.type = 'button'; keep.textContent = '确认保留原卡'; keep.disabled = auditSubmitting;
+      keep.addEventListener('click', () => submitAudit(issue, 'keep', {})); actions.append(keep);
+    }
+    const cancel = document.createElement('button'); cancel.type = 'button'; cancel.textContent = '取消本项'; cancel.disabled = auditSubmitting;
+    cancel.addEventListener('click', () => {
+      card.remove(); auditNotice = '已取消本次查看，没有提交任何修改。刷新后候选仍可重新检查。';
+      $('managementStatus').textContent = '已取消查看';
+    }); actions.append(cancel);
+    card.append(actions);
+    body.append(card);
+  });
+}
+
+function newOperationId() {
+  if (window.crypto && typeof window.crypto.randomUUID === 'function') return window.crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, char => {
+    const value = Math.random() * 16 | 0;
+    return (char === 'x' ? value : (value & 3 | 8)).toString(16);
+  });
+}
+
+async function submitAudit(issue, action, extra) {
+  if (auditSubmitting) return;
+  if (action === 'merge' && !String(extra.merged || '').trim()) {
+    auditNotice = '拟合并正文不能为空；没有提交修改。'; renderAudit(); return;
+  }
+  const versions = {};
+  (issue.cards || []).forEach(card => { versions[String(card.id || '')] = String(card.version || ''); });
+  const request = Object.assign({
+    action, issue_id: String(issue.issue_id || ''), versions, operation_id: newOperationId()
+  }, extra || {});
+  auditSubmitting = true; auditNotice = '正在提交已确认的审计操作…'; renderAudit();
+  try {
+    const response = await fetch('/audit', {
+      method: 'POST', cache: 'no-store', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(request)
+    });
+    let payload = null;
+    try { payload = await response.json(); } catch (e) { /* keep null */ }
+    if (!response.ok || !payload || payload.ok !== true) {
+      const error = new Error((payload && payload.error) || ('HTTP ' + response.status));
+      error.conflict = response.status === 409 || !!(payload && payload.conflict);
+      throw error;
+    }
+    auditNotice = payload.idempotent ? '该操作此前已成功提交，本次重试没有重复写入。' : '审计操作已提交；正在刷新候选和图谱。';
+    dataRevision += 1;
+    await loadAudit();
+    await load('', true);
+  } catch (e) {
+    auditNotice = `${e.conflict ? '候选已变化，请刷新后重新核对' : '提交失败'}：${e.message || '请求失败'}。没有继续执行后续操作。`;
+    if (e.conflict) await loadAudit();
+    else renderAudit();
+  } finally {
+    auditSubmitting = false;
+    if (activeView === 'audit') renderAudit();
+  }
+}
+// 独立事实卡（没有审计候选）的人工编辑/软删：走 /fact/* 直连入口，
+// 由侧车写入可重放的 fact_ops.json，因此重建索引、删库重扫、重启都不会丢。
+async function applyFactOperation(action) {
+  const factId = String((selected && selected.factId) || '');
+  const version = String((selected && selected.factVersion) || '');
+  if (!factId) { setStatus('没有定位到事实卡，未提交。'); return; }
+  if (!version) { setStatus('该卡缺少版本号（可能还没建过库），请先重建索引再操作。'); return; }
+  let newBody = '';
+  if (action === 'edit') {
+    if (selected.factBodyTruncated) {
+      setStatus('正文超过 1600 字符，页面无法安全编辑；请直接修改事实卡文件后重建索引。');
+      return;
+    }
+    const value = window.prompt('编辑正文（格式：日期 | 涉及谁 | 属哪件事 | 一句话事实）', String(selected.factBody || ''));
+    if (value === null) return;
+    newBody = value.trim();
+    if (!newBody) { setStatus('正文不能为空，未提交。'); return; }
+  } else if (!window.confirm('确认软删这张事实卡？\n\n' + shortText(selected.label || factId, 80) +
+                             '\n\n软删后召回和画像都不会再用它；记录会写入 fact_ops.json，重建后依然生效。')) {
+    return;
+  }
+  const request = {op_id: newOperationId(), fact_id: factId, base_version: version};
+  if (action === 'edit') request.new_body = newBody;
+  setStatus(action === 'edit' ? '正在提交正文修改…' : '正在提交软删…');
+  try {
+    const response = await fetch('/fact/' + action, {
+      method: 'POST', cache: 'no-store', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(request)
+    });
+    let payload = null;
+    try { payload = await response.json(); } catch (e) { /* keep null */ }
+    if (!response.ok || !payload || payload.ok !== true) {
+      const error = new Error((payload && payload.error) || ('HTTP ' + response.status));
+      error.conflict = response.status === 409 || !!(payload && payload.conflict);
+      throw error;
+    }
+    setStatus(payload.idempotent ? '该操作此前已提交，本次没有重复写入。'
+                                 : (action === 'edit' ? '正文已更新。' : '事实卡已软删。'));
+    dataRevision += 1;
+    await load(lastGraphQuery, lastGraphAll);
+    if (activeView === 'profile') await loadProfile(profileState.name, profileState.kind, profileState.offset);
+    else if (activeView === 'management') await loadManagementFacts(managementOffset);
+  } catch (e) {
+    setStatus((e.conflict ? '版本已变化，请刷新后重新核对' : '提交失败') + '：' + (e.message || '请求失败'));
+  }
+}
+function hideMenu() { $('context').style.display = 'none'; }
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    setStatus('已复制：' + shortText(text, 60));
+  } catch (e) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.append(ta);
+    ta.select();
+    try { document.execCommand('copy'); setStatus('已复制：' + shortText(text, 60)); }
+    catch (err) { setStatus('复制失败，请手动选择文本'); }
+    finally { ta.remove(); }
+  }
+}
+
+function expandNode(v) {
+  hideMenu();
+  if (!v || !v.id) return;
+  load('', false, v.id, true);
+}
+
+function collapseNode(v) {
+  hideMenu();
+  if (!v) return;
+  const remove = new Set();
+  const walk = id => {
+    data.edges.forEach(e => {
+      if (e.kind === 'hierarchy' && e.source === id && e.target !== v.id && !remove.has(e.target)) {
+        remove.add(e.target);
+        walk(e.target);
+      }
+    });
+  };
+  walk(v.id);
+  if (remove.size) {
+    data.nodes = data.nodes.filter(n => !remove.has(n.id));
+    data.edges = data.edges.filter(e => !remove.has(e.source) && !remove.has(e.target));
+  } else {
+    const keep = new Set([v.id]);
+    data.edges.forEach(e => {
+      if (e.kind === 'hierarchy' && e.target === v.id) keep.add(e.source);
+    });
+    data.nodes = data.nodes.filter(n => keep.has(n.id));
+    data.edges = data.edges.filter(e => keep.has(e.source) && keep.has(e.target));
+  }
+  setStatus(`${data.nodes.length} 个节点 · ${data.edges.length} 条关系`);
+  draw();
+}
+
+function zoomAt(nextZoom, sx, sy) {
+  const rect = svg.getBoundingClientRect();
+  const w = rect.width || 1200, h = rect.height || 800;
+  const px = sx - rect.left, py = sy - rect.top;
+  const worldX = (-pan.x + px) / zoom;
+  const worldY = (-pan.y + py) / zoom;
+  zoom = Math.max(0.25, Math.min(3, nextZoom));
+  pan.x = -worldX * zoom + px;
+  pan.y = -worldY * zoom + py;
+  project();
+  applyZoom();
+}
+
+$('context').addEventListener('click', async e => {
+  const action = e.target && e.target.dataset ? e.target.dataset.action : '';
+  if (!action) return;
+  hideMenu();
+  if (action === 'reset-layout') {
+    pinned.clear();
+    savePinned();
+    draw();
+    project();
+    return;
+  }
+  if (!selected) return;
+  if (action === 'open') openDetail(selected);
+  if (action === 'profile-fact-edit' || action === 'profile-fact-retire') {
+    await applyFactOperation(action === 'profile-fact-edit' ? 'edit' : 'retire');
+  }
+  else if (action === 'profile-fact-audit' || action === 'profile-fact-soft-delete') {
+    const factId = String(selected.factId || '');
+    setView('audit');
+    await loadAudit();
+    // 画像行用的是数据库条目 ID，审计候选用的是审计卡 ID；两者通过 entry_id 对应
+    const matchCard = (cards) => (cards || []).find(card =>
+      String(card.id || '') === factId || String(card.entry_id || '') === factId);
+    const issue = auditIssues.find(item => matchCard(item.cards));
+    if (!issue) {
+      auditNotice = '该事实卡当前没有待处理的审计候选；请先刷新审计或保留原卡。';
+      renderAudit();
+    } else if (action === 'profile-fact-soft-delete') {
+      auditNotice = '已找到候选。再次确认后将按当前版本执行软删。';
+      renderAudit();
+      await submitAudit(issue, 'soft_delete', {card_id: (matchCard(issue.cards) || {}).id || factId});
+    } else {
+      auditNotice = '已定位到包含该事实卡的审计候选，请核对出处和版本后操作。';
+      renderAudit();
+    }
+  }
+  else if (action === 'profile') openProfile(selected.label || selected.id, 'auto');
+  else if (action === 'copy') await copyText(selected.label || selected.id);
+  else if (action === 'copy-source') await copyText(selected.source || selected.label || selected.id);
+  else if (action === 'search') {
+    $('query').value = selected.label || selected.id;
+    load($('query').value.trim());
+  } else if (action === 'expand') expandNode(selected);
+  else if (action === 'collapse') collapseNode(selected);
+  else if (action === 'reset-node') {
+    if (selected && selected.id) {
+      pinned.delete(selected.id);
+      savePinned();
+      draw();
+      project();
+    }
+  }
+});
+document.addEventListener('click', e => {
+  if (!e.target.closest('#context')) hideMenu();
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { hideMenu(); highlight(null); }
+});
+
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  zoomAt(zoom * (e.deltaY < 0 ? 1.12 : 0.89), e.clientX, e.clientY);
+}, {passive: false});
+
+canvas.addEventListener('pointerdown', e => {
+  if (e.target.closest('.node')) return;
+  hideMenu();
+  drag = {x: e.clientX - pan.x, y: e.clientY - pan.y};
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointermove', e => {
+  if (!drag) return;
+  pan.x = e.clientX - drag.x;
+  pan.y = e.clientY - drag.y;
+  project();
+});
+canvas.addEventListener('pointerup', () => { drag = null; });
+canvas.addEventListener('pointercancel', () => { drag = null; });
+canvas.addEventListener('contextmenu', e => {
+  if (e.target.closest('.node')) return;
+  e.preventDefault();
+  showMenu(e.clientX, e.clientY, null);
+});
+
+$('searchBtn').onclick = () => load($('query').value.trim());
+$('overviewBtn').onclick = () => { $('query').value = ''; load('', true); };
+$('moreBtn').onclick = () => loadMore();
+
+// 右侧面板宽度：可拖拽分隔条调整，双击复位，方向键微调；宽度记在本地。
+const SIDE_WIDTH_KEY = 'memory-graph-side-width';
+const SIDE_DEFAULT = 310;
+const SIDE_MIN = 220;
+function sideWidthBounds() {
+  return {min: SIDE_MIN, max: Math.max(SIDE_MIN + 40, Math.min(900, window.innerWidth * 0.72))};
+}
+function applySideWidth(px) {
+  const {min, max} = sideWidthBounds();
+  const width = Math.max(min, Math.min(max, Math.round(px)));
+  document.documentElement.style.setProperty('--side-width', width + 'px');
+  try { localStorage.setItem(SIDE_WIDTH_KEY, String(width)); } catch (e) { /* 存储不可用就只在本次生效 */ }
+  return width;
+}
+function currentSideWidth() {
+  const raw = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--side-width'), 10);
+  return Number.isFinite(raw) ? raw : SIDE_DEFAULT;
+}
+(function initSideSplitter() {
+  const handle = $('sideSplitter');
+  if (!handle) return;
+  let saved = SIDE_DEFAULT;
+  try {
+    const value = parseInt(localStorage.getItem(SIDE_WIDTH_KEY) || '', 10);
+    if (Number.isFinite(value) && value > 0) saved = value;
+  } catch (e) { /* 忽略 */ }
+  applySideWidth(saved);
+  let dragging = false;
+  handle.addEventListener('pointerdown', e => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    dragging = true;
+    handle.classList.add('dragging');
+    handle.setPointerCapture(e.pointerId);
+  });
+  handle.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    // 右侧留出 12px 间隙，避免把面板拖到贴边看不见
+    applySideWidth(window.innerWidth - e.clientX - 12);
+  });
+  const stop = () => { dragging = false; handle.classList.remove('dragging'); };
+  handle.addEventListener('pointerup', stop);
+  handle.addEventListener('pointercancel', stop);
+  handle.addEventListener('dblclick', () => applySideWidth(SIDE_DEFAULT));
+  handle.addEventListener('keydown', e => {
+    if (e.key === 'ArrowLeft') { e.preventDefault(); applySideWidth(currentSideWidth() + 24); }
+    else if (e.key === 'ArrowRight') { e.preventDefault(); applySideWidth(currentSideWidth() - 24); }
+  });
+  window.addEventListener('resize', () => applySideWidth(currentSideWidth()));
+})();
+$('graphViewBtn').onclick = () => setView('graph');
+$('managementViewBtn').onclick = () => setView('management');
+$('profileViewBtn').onclick = () => setView('profile');
+$('auditViewBtn').onclick = () => setView('audit');
+$('refreshAuditBtn').onclick = () => { auditNotice = ''; loadAudit(); };
+$('openProfileBtn').onclick = () => loadProfile($('profileQuery').value, $('profileKind').value, 0);
+$('entityListBtn').onclick = () => {
+  // 回到"直接看标签列表"，不需要先知道名字
+  profileState = {name: '', kind: 'auto', offset: 0, limit: 50, sort: 'name',
+                  usage: '', importance: '', data: null, error: ''};
+  entityState.loaded = false;
+  renderEntityList($('managementBody'));
+};
+$('profileQuery').addEventListener('keydown', e => { if (e.key === 'Enter') loadProfile($('profileQuery').value, $('profileKind').value, 0); });
+$('profileKind').addEventListener('change', () => {
+  if (activeView === 'profile' && $('profileQuery').value.trim()) loadProfile($('profileQuery').value, $('profileKind').value, 0);
+});
+['profileSort', 'profileUsage', 'profileImportance'].forEach(id => {
+  $(id).addEventListener('change', () => {
+    if (activeView === 'profile' && profileState.name) loadProfile(profileState.name, profileState.kind, 0);
+  });
+});
+$('factQuery').addEventListener('input', () => {
+  clearTimeout(managementSearchTimer);
+  managementSearchTimer = setTimeout(() => loadManagementFacts(0), 250);
+});
+$('refreshFactsBtn').onclick = async () => {
+  if (activeView === 'profile') {
+    await loadProfile(profileState.name || $('profileQuery').value, profileState.kind || $('profileKind').value, profileState.offset || 0);
+  } else if (activeView === 'management') {
+    await loadManagementFacts(managementOffset);
+  } else {
+    await load($('query').value.trim(), !$('query').value.trim());
+    if (activeView === 'audit') renderAudit();
+  }
+};
+$('factSort').addEventListener('change', () => loadManagementFacts(0));
+$('usageFilter').addEventListener('change', () => loadManagementFacts(0));
+$('importanceFilter').addEventListener('change', () => loadManagementFacts(0));
+$('previousFactsBtn').onclick = () => {
+  if (activeView === 'profile') {
+    if (profileState.offset > 0) loadProfile(profileState.name, profileState.kind, Math.max(0, profileState.offset - profileState.limit));
+  } else loadManagementFacts(Math.max(0, managementOffset - MANAGEMENT_PAGE_SIZE));
+};
+$('nextFactsBtn').onclick = () => {
+  if (activeView === 'profile') {
+    if (profileState.data && profileState.data.has_more) loadProfile(profileState.name, profileState.kind, profileState.offset + profileState.limit);
+    return;
+  }
+  if (managementOffset + managementFacts.length < managementTotal) {
+    loadManagementFacts(managementOffset + MANAGEMENT_PAGE_SIZE);
+  }
+};
+$('query').addEventListener('keydown', e => {
+  if (e.key === 'Enter') load(e.target.value.trim());
+});
+const THEMES = ['native', 'light', 'ocean', 'forest', 'dark', 'glass'];
+const THEME_LABEL = {native: '原生', light: '暖白', ocean: '海洋', forest: '森林', dark: '暗夜', glass: '玻璃'};
+function currentTheme() {
+  const hit = THEMES.find(t => document.body.classList.contains('theme-' + t));
+  return hit || 'native';
+}
+function applyTheme(name) {
+  if (!THEMES.includes(name)) name = 'native';
+  THEMES.forEach(t => document.body.classList.remove('theme-' + t));
+  document.body.classList.add('theme-' + name);
+  document.documentElement.style.colorScheme = name === 'dark' ? 'dark' : 'light';
+  const btn = $('themeBtn');
+  btn.value = name;
+  btn.setAttribute('aria-label', '当前主题：' + THEME_LABEL[name]);
+  try { localStorage.setItem('memory-graph-theme', name); } catch (e) { }
+}
+$('themeBtn').onchange = event => {
+  applyTheme(event.target.value);
+};
+try {
+  let saved = localStorage.getItem('memory-graph-theme');
+  applyTheme(saved || 'native');
+} catch (e) { applyTheme('light'); }
+
+window.addEventListener('resize', resizeGraph);
+if (window.ResizeObserver) new ResizeObserver(resizeGraph).observe(canvas);
+load('', true);
+})();
+</script>
+</body>
+</html>
