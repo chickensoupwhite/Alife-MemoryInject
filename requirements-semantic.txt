@@ -4,7 +4,14 @@ onnxruntime>=1.18
 tokenizers>=0.19
 transformers>=4.30
 
-# torch 必须装 CPU 版：默认 PyPI 上的 torch 会带整套 CUDA 运行时，
-# 光 import 就多占 1.3G 私有内存，每个角色的侧车进程都吃一份。
-# 这里不写裸 torch 行，免得 pip install -r 直接拉成 CUDA 版。请单独执行：
-#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# torch 不写进这里，按机器情况自己选一版单独装（二选一，别用裸 pip install torch）：
+
+# A. 只有 CPU / 想省内存 —— 推荐
+#    侧车常驻内存约 0.9G；GPU 版光 import 就多占 1.3G 私有内存，每个角色的侧车进程各吃一份。
+#    pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# B. 有独显、想让向量算得更快
+#    侧车常驻内存约 2~4G，视显存与 CUDA 版本而定；显存不够时会自动退回 CPU。
+#    pip install torch --index-url https://download.pytorch.org/whl/cu128
+
+# 装完重启框架，memstatus 里"语义"一栏显示 就绪 即为成功。
