@@ -12,20 +12,45 @@ import struct
 
 # >>> WP1 导入（自动生成，勿手改）
 from state import W_HEAD, W_SUMMARY, W_TAG, W_TEXT, _DB, _DB_SCHEMA, _VEC_CACHE, _set_index, _warn
-from textsim import _entry_weight, extract_entities
+from textsim import _entry_weight, classify_tags, entry_nodes, extract_entities, hay_of, split_tag_list
 # <<< WP1 导入
+
+# 库级迁移标记：1 = 历史 people 列的顿号已归一为竖线
+_DB_USER_VERSION = 1
+
+# 进程内向量缓存上限：5 万条 × 512 维的 Python list 会吃掉几百 MB
+_VEC_MEM_LIMIT = 4000
+
+
+def _vec_key(eid, version="", model=""):
+    """缓存键 = 条目 + 正文版本 + 模型标识，三者任一变化都不会误用旧向量。"""
+    return "v:%s@%s@%s" % (eid, version or "-", model or "-")
+
+
+def _vec_mem_put(key, vec):
+    _VEC_CACHE[key] = vec
+    while len(_VEC_CACHE) > _VEC_MEM_LIMIT:
+        try:
+            _VEC_CACHE.pop(next(iter(_VEC_CACHE)))
+        except (StopIteration, KeyError):
+            break
+
+
 def _is_meta_file(name):
     """是不是插件自己的元文件（审计报告/水位/排除清单/索引/备份/视图），这些绝不能当记忆索引。"""
     n = (name or "").lower()
     if n.startswith("审计报告_"):
         return True
-    if n in ("llm_organize_state.txt", "compacted_sources.txt", "index.json", "index_manifest.json"):
+    if n in ("llm_organize_state.txt", "compacted_sources.txt", "index.json", "index_manifest.json",
+             "scope_signature.txt", "pending_proposal_sources.txt"):
         return True
     if n.startswith("index.json.") or n.startswith("index_manifest"):
         return True
+    if n.startswith("scope_signature") or n.startswith("pending_proposal"):
+        return True
     if n.startswith("memory.db") or ".swap-" in n:
         return True
-    if n.endswith(".html"):
+    if n.endswith(".html") or n.endswith(".json") or n.endswith(".log"):
         return True
     return False
 
@@ -52,6 +77,26 @@ def _is_excluded(rel, ex):
     return False
 
 
+def _db_normalize_tag_separators(c):
+    """历史 people 列混用过顿号（如 主人|真央、主人）。只做格式归一：切分、去空、去重。
+
+    不改语义内容（代词、技术名由读取侧过滤），所以这一步是幂等的、不需要撤回。
+    返回被修正的行数。
+    """
+    try:
+        rows = c.execute("SELECT id, people FROM entries WHERE instr(people, ?)>0",
+                         ("\u3001",)).fetchall()
+    except sqlite3.Error as e:
+        _warn("scan legacy tag separators", e)
+        return 0
+    fixed = 0
+    for row in rows:
+        names = split_tag_list(row["people"])
+        c.execute("UPDATE entries SET people=? WHERE id=?", ("|".join(names), row["id"]))
+        fixed += 1
+    return fixed
+
+
 def _db_open(db_path):
     try:
         if not db_path:
@@ -72,12 +117,32 @@ def _db_open(db_path):
         except sqlite3.OperationalError as e:
             if "duplicate column" not in str(e).lower():
                 _warn("upgrade entries.text_hash column: %s" % db_path, e)
+        # 5.1：共同主体与待分类单独成列（people 只放确认人物，见 PROFILE-04）
+        for column in ("people_shared", "people_pending"):
+            try:
+                c.execute("ALTER TABLE entries ADD COLUMN %s TEXT" % column)
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    _warn("upgrade entries.%s column: %s" % (column, db_path), e)
         try:
             c.execute("CREATE INDEX IF NOT EXISTS ix_entries_hash ON entries(text_hash)")
         except sqlite3.Error as e:
             _warn("create entries hash index: %s" % db_path, e)
+        _db_vec_migrate(c)
+        _db_prepare_semantic_revision(c)
         _db_prepare_call_events(c)
         _db_sync_call_aggregates(c)
+        # 一次性把历史 people 列的顿号归一成竖线（幂等；用 user_version 记标记）
+        try:
+            version = int(c.execute("PRAGMA user_version").fetchone()[0] or 0)
+        except (sqlite3.Error, TypeError, ValueError):
+            version = _DB_USER_VERSION
+        if version < _DB_USER_VERSION:
+            fixed = _db_normalize_tag_separators(c)
+            c.execute("PRAGMA user_version=%d" % _DB_USER_VERSION)
+            if fixed:
+                _warn("normalize legacy tag separators", RuntimeError("%d rows updated" % fixed))
+            upgraded = upgraded or bool(fixed)
         c.commit()
         if upgraded:
             try:
@@ -93,6 +158,18 @@ def _db_open(db_path):
         _warn("open plugin database: %s" % db_path, e)
         _DB.update({"ok": False, "path": db_path, "conn": None})
         return None
+
+
+def _db_prepare_semantic_revision(c):
+    c.execute("CREATE TABLE IF NOT EXISTS semantic_revision(id INTEGER PRIMARY KEY,revision INTEGER NOT NULL)")
+    c.execute("INSERT OR IGNORE INTO semantic_revision VALUES(1,0)")
+    for table in ("entries", "vec"):
+        updates = ("UPDATE OF body,text_hash,retired,source,date,time,period,hour,people,topics,things,people_shared,people_pending,summary,head"
+                   if table == "entries" else "UPDATE")
+        for action, event in (("insert", "INSERT"), ("delete", "DELETE"), ("update", updates)):
+            c.execute("CREATE TRIGGER IF NOT EXISTS semantic_%s_%s AFTER %s ON %s "
+                      "BEGIN UPDATE semantic_revision SET revision=revision+1 WHERE id=1; END"
+                      % (table, action, event, table))
 
 
 def _db_prepare_call_events(c):
@@ -153,6 +230,44 @@ def _is_fact_source(source):
     return normalized.lower().startswith("facts/")
 
 
+def _db_log_maintenance(c, ok, scanned=0, soft_deleted=0, purged=0, allow_soft=False, error=""):
+    """记一次维护结果：memstatus 要能看出上次维护跑没跑、删了几条、为什么失败。"""
+    if c is None:
+        return False
+    try:
+        c.execute("INSERT INTO maintenance_runs(created_at,ok,scanned,soft_deleted,purged,"
+                  "allow_soft,error) VALUES(?,?,?,?,?,?,?)",
+                  (datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                   1 if ok else 0, int(scanned or 0), int(soft_deleted or 0),
+                   int(purged or 0), 1 if allow_soft else 0, str(error or "")))
+        # 只留最近 50 次，别让日志表无限长
+        c.execute("DELETE FROM maintenance_runs WHERE id NOT IN "
+                  "(SELECT id FROM maintenance_runs ORDER BY id DESC LIMIT 50)")
+        c.commit()
+        return True
+    except sqlite3.Error as e:
+        _warn("log maintenance run", e)
+        return False
+
+
+def maintenance_status(limit=5):
+    """最近几次维护的结果，供 memstatus 显示。"""
+    c = _DB.get("conn")
+    if c is None:
+        return {"available": False, "runs": [], "last": None}
+    try:
+        rows = c.execute("SELECT created_at,ok,scanned,soft_deleted,purged,allow_soft,error "
+                         "FROM maintenance_runs ORDER BY id DESC LIMIT ?",
+                         (max(1, int(limit)),)).fetchall()
+    except sqlite3.Error as e:
+        _warn("read maintenance history", e)
+        return {"available": False, "runs": [], "last": None}
+    runs = [{"created_at": r["created_at"], "ok": bool(r["ok"]), "scanned": int(r["scanned"] or 0),
+             "soft_deleted": int(r["soft_deleted"] or 0), "purged": int(r["purged"] or 0),
+             "allow_soft": bool(r["allow_soft"]), "error": str(r["error"] or "")} for r in rows]
+    return {"available": True, "runs": runs, "last": runs[0] if runs else None}
+
+
 def _db_for(outpath):
     """按索引输出路径定位同目录的 memory.db（每角色一份）。"""
     dbp = os.path.join(os.path.dirname(outpath or ""), "memory.db") if outpath else ""
@@ -173,21 +288,30 @@ def _db_for(outpath):
 
 
 def _row_entry(c, r):
-    """SQL 行 -> 条目 dict（tags 还原成列表，兼容旧算法）。"""
+    """SQL 行 -> 条目 dict（标签还原成列表，兼容旧算法）。"""
     d = dict(r)
     d["text"] = d.pop("body", "")
     for k in ("people", "topics", "things"):
-        v = d.get(k) or ""
-        d[k] = [x for x in v.split("|") if x]
+        # 历史数据混用过顿号（主人|真央、主人），统一按两种分隔符切开
+        d[k] = split_tag_list(d.get(k))
+    # 共同主体与待分类是 5.1 新增列：旧库没有这两列时按空处理
+    d["shared"] = split_tag_list(d.pop("people_shared", ""))
+    d["pending"] = split_tag_list(d.pop("people_pending", ""))
     d["retired"] = bool(d.get("retired"))
     return d
 
 
 def _entry_row(e, hay=None):
-    tags = " ".join((e.get("people") or []) + (e.get("topics") or []) + (e.get("things") or []))
+    # ★主体分类在这里统一执行，所有写入路径（建库、审计投影、人工操作重放、
+    #   维护整理）都经过这里，避免"哪儿记得住就哪儿校验"的碎片规则（PROFILE-04）。
+    tags = classify_tags(e)
+    shared = list(tags["shared"])
+    for raw in (e.get("shared") or []):
+        if raw and raw not in shared:
+            shared.append(raw)
     if hay is None:
-        hay = " ".join([str(e.get("head") or ""), str(e.get("summary") or ""),
-                        str(e.get("text") or ""), tags]).lower()
+        # 用落库后的 head（截断 60 字）算 hay，否则重算会与库里的值永远差一条
+        hay = hay_of(dict(e, head=(e.get("head") or "")[:60]), tags)
     th = e.get("_hash")
     if not th:
         norm = re.sub(r"\s+", "", str(e.get("text") or ""))
@@ -197,10 +321,14 @@ def _entry_row(e, hay=None):
         e.get("time") or "", e.get("date") or "", e.get("period") or "",
         e.get("hour"), (e.get("head") or "")[:60], e.get("summary") or "",
         e.get("text") or "", hay, th,
-        "|".join(e.get("people") or []), "|".join(e.get("topics") or []),
-        "|".join(e.get("things") or []),
+        # 落库前再理一遍：切分、去空、去重，保证列里只有竖线分隔
+        "|".join(tags["people"]),
+        "|".join(tags["topics"]),
+        "|".join(tags["things"]),
         int(e.get("access_count") or 0), e.get("last_access") or "",
         1 if e.get("retired") else 0, e.get("retired_at") or "",
+        "|".join(shared),
+        "|".join(tags["pending"]),
     )
 
 
@@ -213,8 +341,8 @@ def _db_upsert(c, e):
     try:
         c.execute(
             "INSERT OR REPLACE INTO entries(id,anchor,source,time,date,period,hour,head,summary,body,hay,text_hash,"
-            "people,topics,things,access_count,last_access,retired,retired_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "people,topics,things,access_count,last_access,retired,retired_at,people_shared,people_pending) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             _entry_row(e))
         return True
     except sqlite3.Error as error:
@@ -297,11 +425,13 @@ def _edge_type(a, b, people, topics, things, ents):
     return "|".join(ts)
 
 
-def _db_rebuild_links(c):
+def _db_rebuild_links(c, commit=True):
     """重建互链（标签 + 正文实体，共现边）。建库时跑一次，成本可控。
 
     ★只统计未软删的条目：节点/边是图谱的检索入口，若把已软删的卡也计入，
       图谱搜索仍然能搜到"已经删掉"的人和事（实测：画像里没了、图谱里还在）。
+    ★commit=False 用于"把建图并进调用方事务"的场景（维护撤回需要一次提交，
+      否则中途提交会让回滚失效——四轮复核 P2）。
     """
     try:
         c.execute("DELETE FROM nodes")
@@ -310,18 +440,14 @@ def _db_rebuild_links(c):
         for r in c.execute("SELECT id,head,summary,body,people,topics,things FROM entries "
                            "WHERE COALESCE(retired,0)=0"):
             d = _row_entry(c, r)
-            ns = []
-            for k in ("people", "topics", "things"):
-                ns.extend(d.get(k) or [])
-            ent_text = "%s %s %s" % (d.get("head") or "", d.get("summary") or "", (d.get("text") or "")[:400])
-            for x in extract_entities(ent_text)[:6]:
-                ns.append(x)
-            ns = list(dict.fromkeys([n for n in ns if n]))
+            # 与对话图共用同一套节点规则（标签归一 + 实体过滤）
+            ns = entry_nodes(d)
             for n in ns:
                 nodes[n] = nodes.get(n, 0) + 1
             people = d.get("people") or []
             topics = d.get("topics") or []
             things = d.get("things") or []
+            ent_text = "%s %s %s" % (d.get("head") or "", d.get("summary") or "", (d.get("text") or "")[:400])
             ents = extract_entities(ent_text)
             for i in range(len(ns)):
                 for j in range(i + 1, len(ns)):
@@ -336,10 +462,14 @@ def _db_rebuild_links(c):
         c.executemany("INSERT OR REPLACE INTO nodes(name,n) VALUES(?,?)", list(nodes.items()))
         c.executemany("INSERT OR REPLACE INTO edges(a,b,w,type) VALUES(?,?,?,?)",
                       [(a, b, v["w"], v.get("type") or "共现") for (a, b), v in edges.items()])
-        c.commit()
+        if commit:
+            c.commit()
     except sqlite3.Error as e:
         # 关系重建失败会让图谱停在旧边，原为静默 pass
         _warn("rebuild graph links", e)
+        if not commit:
+            # 调用方拥有事务，必须让它知道建图失败并回滚已执行的清空/写入。
+            raise
 
 
 def _db_ready(req):
@@ -410,20 +540,85 @@ def _db_boost(entry):
     return _entry_weight(entry)
 
 
-def _db_vec_get(c, eid):
-    """向量只缓存在进程内：落库会让 5 万条 × 2KB 膨胀 100MB+，而重算是毫秒级（批量）。"""
-    return _VEC_CACHE.get("v:" + str(eid))
+def _db_vec_get(c, eid, version="", model=""):
+    """向量缓存：先看进程内，再看库。
 
-
-def _db_vec_put(c, eid, vec):
+    失效键 = 条目 id + 正文版本 + 模型标识：正文改了、换模型了，旧向量都不用。
+    库里的行由 `_db_vec_put` 写入，可随时丢弃重建（纯缓存，不是业务状态）。
+    """
+    key = _vec_key(eid, version, model)
+    hit = _VEC_CACHE.get(key)
+    if hit is not None:
+        return hit
+    if c is None:
+        return None
     try:
-        if vec:
-            _VEC_CACHE["v:" + str(eid)] = vec
-            return
-            c.execute("INSERT OR REPLACE INTO vec(id,data) VALUES(?,?)",
-                      (eid, struct.pack("<%df" % len(vec), *vec)))
+        row = c.execute("SELECT data FROM vec WHERE id=? AND version=? AND model=?",
+                        (eid, version, model)).fetchone()
+    except sqlite3.Error as e:
+        _warn("read entry vector: %s" % eid, e)
+        return None
+    if row is None or row["data"] is None:
+        return None
+    blob = row["data"]
+    vec = list(struct.unpack("<%df" % (len(blob) // 4), blob)) if blob else None
+    if vec:
+        _vec_mem_put(key, vec)
+    return vec
+
+
+def _db_vec_put(c, eid, vec, version="", model="", commit=True):
+    """写入进程内缓存并落库；任何失败都只影响缓存命中率，不影响召回。
+
+    事务边界：默认自己提交（单条写入即生效，别的连接立刻能看到、不占写锁）。
+    批量预热传 `commit=False`，由调用方每批提交一次。
+    """
+    if not vec:
+        return
+    key = _vec_key(eid, version, model)
+    _vec_mem_put(key, vec)
+    if c is None:
+        return
+    try:
+        c.execute("INSERT OR REPLACE INTO vec(id,version,model,dim,data) VALUES(?,?,?,?,?)",
+                  (eid, version, model, len(vec), struct.pack("<%df" % len(vec), *vec)))
+        if commit:
+            c.commit()
     except sqlite3.Error as e:
         _warn("persist entry vector: %s" % eid, e)
+        if commit:
+            try:
+                c.rollback()
+            except sqlite3.Error as rollback_error:
+                _warn("rollback entry vector: %s" % eid, rollback_error)
+
+
+def _db_vec_migrate(c):
+    """旧库的 vec 只有 (id,data)：缓存可丢弃，直接重建表结构。"""
+    try:
+        cols = [row[1] for row in c.execute("PRAGMA table_info(vec)").fetchall()]
+    except sqlite3.Error as e:
+        _warn("inspect vec table", e)
+        return
+    if not cols or "version" in cols:
+        return
+    try:
+        c.execute("DROP TABLE vec")
+        c.execute("CREATE TABLE vec(id TEXT PRIMARY KEY, version TEXT, model TEXT, "
+                  "dim INTEGER, data BLOB)")
+        c.commit()
+    except sqlite3.Error as e:
+        _warn("migrate vec table", e)
+
+
+def _db_open_aux(db_path):
+    """给后台预热用的独立连接（SQLite 连接不能跨线程共用）。"""
+    c = sqlite3.connect(db_path, timeout=15)
+    c.row_factory = sqlite3.Row
+    c.executescript(_DB_SCHEMA)
+    _db_vec_migrate(c)
+    c.commit()
+    return c
 
 
 def db_load_all(outpath):

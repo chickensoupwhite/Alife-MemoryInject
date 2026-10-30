@@ -11,7 +11,7 @@ import dbside
 import indexstore
 from stat_tracker import _fact_call_stats
 from state import _GRAPH, _GRAPH_CACHE, _warn
-from textsim import extract_entities
+from textsim import entry_nodes, extract_entities, classify_subject
 # <<< WP1 导入
 
 def build_graph():
@@ -23,16 +23,8 @@ def build_graph():
     for e in indexstore._load_index():
         if e.get("retired"):
             continue
-        ns = []
-        for field in ("people", "topics", "things"):
-            for x in (e.get(field) or []):
-                if x:
-                    ns.append(str(x))
-        # ⑤ 正文实体（规则抽取，不上模型）：并进同一张图，节点比"只有标签"多一层
-        ent_text = "%s %s %s" % (e.get("head") or "", e.get("summary") or "", str(e.get("text") or "")[:400])
-        for x in extract_entities(ent_text)[:6]:
-            ns.append(x)
-        ns = list(dict.fromkeys(ns))
+        # 与页面图共用同一套节点规则（标签归一 + 实体过滤），避免两图不一致
+        ns = entry_nodes(e)
         for n in ns:
             nodes[n] = nodes.get(n, 0) + 1
         for i in range(len(ns)):
@@ -265,6 +257,8 @@ def db_graphdata(req):
             truncated = True
             return None
         node = {"id": nid, "label": _graph_label(label, nid), "kind": kind}
+        if kind not in ("entry", "source"):
+            node["entity_kind"] = classify_subject(label)["kind"]
         node.update(extra)
         nodes[nid] = node
         return node

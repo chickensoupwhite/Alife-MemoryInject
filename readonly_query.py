@@ -14,8 +14,10 @@ from dbside import _db_where_time, _is_fact_source, _row_entry
 from graph_indexer import _graph_int
 import indexstore
 from stat_tracker import _fact_call_stats
-from state import _PROFILE_KIND_COLUMNS, _warn
-from textsim import rel_time
+from state import _CONFIRMED, _PROFILE_KIND_COLUMNS, _warn
+from textsim import can_reject_subject, classify_subject, classified_people, rel_time, split_tag_list
+import profile_view
+import profile_ops
 # <<< WP1 导入
 
 def browse(query=None, who=None, topic=None, thing=None, date_from=None, date_to=None, offset=0, limit=50,
@@ -233,14 +235,54 @@ def db_browse_readonly(req):
         return None
 
 
-def _profile_kind_items(entry):
-    items = []
-    for kind, column in _PROFILE_KIND_COLUMNS.items():
-        for name in entry.get(column) or []:
-            clean = str(name or "").strip()
-            if clean:
-                items.append({"kind": kind, "name": clean})
+def _profile_kind_items(entry, settings=None):
+    """条目参与画像的标签，按统一主体分类重排。
+
+    `people` 列可能来自旧库（含代词、共同主体、软件名），这里逐条判类：
+    确认人物进 person，共同主体拆成参与者，判成软件／事件的回到 object/event，
+    判不准的不进关系图——否则「健康」「打卡」「ComfyUI」会被当成人物关系（PROFILE-04）。
+    """
+    items, seen = [], set()
+
+    def add(kind, name):
+        clean = str(name or "").strip()
+        if settings is not None:
+            if kind == 'person':
+                clean = profile_ops.canonical(settings, clean)
+            if profile_ops.hidden(settings, kind, clean):
+                return
+        key = (kind, clean.casefold())
+        if not clean or key in seen:
+            return
+        seen.add(key)
+        items.append({"kind": kind, "name": clean})
+
+    for raw in entry.get("people") or []:
+        info = classify_subject(raw)
+        if info["kind"] in ("person", "shared"):
+            for person in info["participants"]:
+                add("person", person)
+        elif info["kind"] == "object":
+            add("object", raw)
+        elif info["kind"] == "event":
+            add("event", raw)
+    for name in entry.get("topics") or []:
+        add("event", name)
+    for name in entry.get("things") or []:
+        add("object", name)
     return items
+
+
+def _entry_kind_names(entry, kind, settings=None):
+    """某类别的有效名称；人物类别走主体分类，旧库里的共同主体也能按参与者命中。"""
+    if kind == "person":
+        names = classified_people(entry)
+    else:
+        names = [str(name) for name in (entry.get(_PROFILE_KIND_COLUMNS[kind]) or [])]
+    if settings is not None:
+        names = [profile_ops.canonical(settings, name) if kind == 'person' else name for name in names]
+        names = [name for name in names if not profile_ops.hidden(settings, kind, name)]
+    return list(dict.fromkeys(names))
 
 
 def db_entities_readonly(req):
@@ -248,6 +290,9 @@ def db_entities_readonly(req):
 
     实测反馈：画像只靠搜索不够直观。这里把"事实卡里真实出现过的标签"列出来，
     用户点一下就能看画像，不必先知道名字。
+
+    ★只列确认人物：代词、共同主体、软件名、事件／健康主题按新分类分流到
+    `pending`/`shared`，既不出现在人物列表里，也不删除原文（PROFILE-04）。
     """
     idx = req.get("index") or ""
     dbp = os.path.join(os.path.dirname(idx), "memory.db") if idx else ""
@@ -255,37 +300,113 @@ def db_entities_readonly(req):
         return None
     kind = str(req.get("kind") or "person").strip().lower()
     column = _PROFILE_KIND_COLUMNS.get(kind)
-    if column is None:
+    if column is None and kind not in ("pending", "shared"):
         return {"invalid": True, "error": "a valid entity kind is required"}
     try:
         limit = max(1, min(200, int(req.get("limit") or 60)))
+        offset = max(0, int(req.get("offset") or 0))
     except (TypeError, ValueError):
-        limit = 60
+        limit, offset = 60, 0
     counts = {}
+    pending = {}
+    shared = {}
     try:
+        settings = profile_ops.load(idx)
         uri = "file:" + urllib.parse.quote(os.path.abspath(dbp).replace("\\", "/"), safe="/:\\") + "?mode=ro"
         c = sqlite3.connect(uri, uri=True, timeout=5)
         c.row_factory = sqlite3.Row
         try:
-            for row in c.execute(
-                    "SELECT " + column + " AS tag FROM entries "
+            columns = {row[1] for row in c.execute("PRAGMA table_info(entries)")}
+            shared_column = "people_shared" if "people_shared" in columns else "''"
+            # 5.1 起待分类单独成列；旧库还没有这一列时按空串，仍从 people 里的未知标签兜底（R04）
+            pending_column = "people_pending" if "people_pending" in columns else "''"
+            base = ("SELECT %s AS tag, %s AS shared_tag, %s AS pending_tag FROM entries "
                     "WHERE COALESCE(retired,0)=0 "
-                    "AND lower(replace(source,char(92),'/')) LIKE 'facts/%'"):
-                for name in str(row["tag"] or "").split("|"):
-                    name = name.strip()
-                    if name:
+                    "AND lower(replace(source,char(92),'/')) LIKE 'facts/%%'")
+            if kind in ("person", "pending", "shared"):
+                for row in c.execute(base % ("people", shared_column, pending_column)):
+                    # 同一行内按名称去重，不能因为既在 people 又在 pending 就计两次
+                    row_counts, row_shared, row_pending = {}, {}, {}
+
+                    def add_person(raw):
+                        info = classify_subject(raw)
+                        status = info["kind"]
+                        if status in ("person", "shared"):
+                            if status == "shared":
+                                row_shared.setdefault(raw.casefold(), raw)
+                            for person in info["participants"]:
+                                person = profile_ops.canonical(settings, person)
+                                if profile_ops.hidden(settings, 'person', person):
+                                    continue
+                                row_counts.setdefault(person.casefold(), person)
+                        elif status == "unknown":
+                            row_pending.setdefault(raw.casefold(), raw)
+
+                    for name in split_tag_list(row["tag"]):
+                        add_person(name)
+                    for name in split_tag_list(row["shared_tag"]):
+                        row_shared.setdefault(name.casefold(), name)
+                    for name in split_tag_list(row["pending_tag"]):
+                        # 已持久化的待分类：若用户后来确认了人物，重算时要升回人物
+                        info = classify_subject(name)
+                        if info["kind"] in ("person", "shared"):
+                            add_person(name)
+                        elif info["kind"] == "unknown":
+                            row_pending.setdefault(name.casefold(), name)
+                    for key, name in row_counts.items():
                         counts[name] = counts.get(name, 0) + 1
+                    for key, name in row_shared.items():
+                        shared[name] = shared.get(name, 0) + 1
+                    for key, name in row_pending.items():
+                        pending[name] = pending.get(name, 0) + 1
+            else:
+                for row in c.execute(base % (column, shared_column, pending_column)):
+                    for name in split_tag_list(row["tag"]):
+                        if not profile_ops.hidden(settings, kind, name):
+                            counts[name] = counts.get(name, 0) + 1
         finally:
             c.close()
-    except sqlite3.Error as e:
+    except (sqlite3.Error, ValueError, OSError) as e:
         _warn("list entities: %s" % dbp, e)
         return None
-    items = sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))[:limit]
+
+    def _items(source):
+        ordered = sorted(source.items(), key=lambda pair: (-pair[1], pair[0]))
+        return [{"name": name, "count": count, "can_reject": can_reject_subject(name)}
+                for name, count in ordered]
+
+    # 用户标记过"不是人物"的标签：原文仍在 people_pending 列里，但不再进入待分类队列（S06）
+    rejected = {str(name).casefold() for name in (_CONFIRMED.get("rejected") or set())}
+    if rejected:
+        pending = {name: count for name, count in pending.items()
+                   if str(name).casefold() not in rejected}
+
+    def _page(source):
+        ordered = _items(source)
+        page = ordered[offset:offset + limit]
+        return page, len(ordered), offset + len(page) < len(ordered)
+
+    if kind == "pending":
+        items, total, has_more = _page(pending)
+        return {"kind": kind, "items": items, "total": total, "offset": offset,
+                "truncated": has_more, "has_more": has_more,
+                "note": "判不准是否人物，留待分类，不计入人物列表"}
+    if kind == "shared":
+        items, total, has_more = _page(shared)
+        return {"kind": kind, "items": items, "total": total, "offset": offset,
+                "truncated": has_more, "has_more": has_more,
+                "note": "共同主体，已按参与者计入各自画像"}
+    items = _items(counts)[:limit]
     return {
         "kind": kind,
-        "items": [{"name": name, "count": count} for name, count in items],
+        "items": items,
         "total": len(counts),
         "truncated": len(counts) > limit,
+        "pending": _items(pending)[:50],
+        "pending_total": len(pending),
+        "shared": _items(shared)[:20],
+        "shared_total": len(shared),
+        "management": settings,
     }
 
 
@@ -300,6 +421,9 @@ def db_profile_readonly(req):
     if not name or requested_kind not in ("auto",) + tuple(_PROFILE_KIND_COLUMNS):
         return {"invalid": True, "error": "a valid entity name and kind are required"}
     try:
+        settings = profile_ops.load(idx)
+        person_name = profile_ops.canonical(settings, name)
+        lookup_names = profile_ops.family(settings, person_name) if requested_kind in ('auto', 'person') else [name]
         uri = "file:" + urllib.parse.quote(os.path.abspath(dbp).replace("\\", "/"), safe="/:\\") + "?mode=ro"
         c = sqlite3.connect(uri, uri=True, timeout=5)
         c.row_factory = sqlite3.Row
@@ -314,17 +438,17 @@ def db_profile_readonly(req):
             candidates = c.execute(
                 "SELECT * FROM entries WHERE retired=0 "
                 "AND lower(replace(source,char(92),'/')) LIKE 'facts/%' "
-                "AND (instr('|' || COALESCE(people,'') || '|','|' || ? || '|')>0 "
-                "OR instr('|' || COALESCE(topics,'') || '|','|' || ? || '|')>0 "
-                "OR instr('|' || COALESCE(things,'') || '|','|' || ? || '|')>0) "
+                # 先用子串把候选捞出来（共同主体「主人/真央」里也含 真央），
+                # 归属仍由 _entry_kind_names 的精确判定决定：子串命中不会直接变成个人事实。
+                "AND (" + ' OR '.join("(instr(COALESCE(people,''), ?)>0 OR instr(COALESCE(topics,''), ?)>0 OR instr(COALESCE(things,''), ?)>0)" for _ in lookup_names) + ") "
                 "ORDER BY date DESC,time DESC,id",
-                (name, name, name),
+                [value for lookup in lookup_names for value in (lookup, lookup, lookup)],
             ).fetchall()
             matched_by_kind = {kind: [] for kind in _PROFILE_KIND_COLUMNS}
             for row in candidates:
                 entry = _row_entry(c, row)
-                for kind, column in _PROFILE_KIND_COLUMNS.items():
-                    if name in entry.get(column, []):
+                for kind in _PROFILE_KIND_COLUMNS:
+                    if (person_name if kind == 'person' else name) in _entry_kind_names(entry, kind, settings):
                         matched_by_kind[kind].append((row, entry))
             available_kinds = [kind for kind, rows in matched_by_kind.items() if rows]
             if requested_kind == "auto":
@@ -341,6 +465,8 @@ def db_profile_readonly(req):
                 kind = available_kinds[0]
             else:
                 kind = requested_kind
+            if kind == 'person':
+                name = person_name
             matched = matched_by_kind.get(kind, [])
             if not matched:
                 return {
@@ -358,7 +484,7 @@ def db_profile_readonly(req):
             for row, entry in matched:
                 fact_id = str(entry.get("id") or "")
                 source = str(entry.get("source") or "")
-                for peer in _profile_kind_items(entry):
+                for peer in _profile_kind_items(entry, settings):
                     if peer["kind"] == kind and peer["name"] == name:
                         continue
                     key = (peer["kind"], peer["name"])
@@ -468,7 +594,7 @@ def db_profile_readonly(req):
                 item["excerpt_truncated"] = len(body_text) > 1600
                 # 版本号：与 /facts 同一口径，供人工编辑/软删做并发校验
                 item["version"] = str(entry.get("text_hash") or "")
-                item["related_entities"] = _profile_kind_items(entry)
+                item["related_entities"] = _profile_kind_items(entry, settings)
                 item["importance"] = entry.get("importance") if "importance" in entry else None
                 item["importance_source"] = entry.get("importance_source") if "importance_source" in entry else "未知"
                 item_stats = profile_stats.get(item["id"])
@@ -487,6 +613,9 @@ def db_profile_readonly(req):
                 "relations": relations,
                 "relations_complete": True,
                 "items": items,
+                # 画像摘要：直接事实／共同事件分开，主题归纳只写有证据的部分（PROFILE-01~03）
+                "summary": profile_view.build([entry for _row, entry in matched], name, limit=20,
+                                               aliases=profile_ops.family(settings, name) if kind == 'person' else None),
                 "text": "按精确标签关联 %d 张有效事实卡；实体关系表示共同出现在这些卡片中，不代表因果或身份消歧。" % len(profile_items),
             }
         finally:
@@ -551,7 +680,21 @@ def db_stats(req):
     n = c.execute("SELECT COUNT(*) FROM entries WHERE retired=0").fetchone()[0]
     row = c.execute("SELECT MIN(date), MAX(date) FROM entries WHERE retired=0").fetchone()
     first, last = (row[0] or ""), (row[1] or "")
+    # ★实际分派走的是这里（_DB_OPS['stats']），不是回忆引擎里 index_stats 的兜底；
+    #   维护记录与语义状态必须挂在这条路径上，否则 memstatus 永远看不到（审查 R4）。
+    maintenance_info = {"available": False, "runs": [], "last": None}
+    semantic_info = {}
+    try:
+        maintenance_info = dbside.maintenance_status(5)
+    except Exception as exc:
+        dbside._warn("read maintenance status", exc)
+    try:
+        import recall_engine
+        semantic_info = recall_engine.vec_stats()
+    except Exception as exc:
+        dbside._warn("read semantic status", exc)
     return {"count": n, "first": first, "last": last,
+            "maintenance": maintenance_info, "semantic": semantic_info,
             "text": "索引共 %d 条，覆盖 %s ~ %s" % (n, first or "?", last or "?")}
 
 

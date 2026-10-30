@@ -19,7 +19,8 @@ import datetime
 
 import dbside
 from state import _GRAPH, _IDX, _set_index, _warn
-from textsim import _audit_card_id, _fact_files, _parse_fact, _split_blocks, _tag
+from textsim import (_audit_card_id, _fact_files, _parse_fact, _split_blocks, _tag,
+                     classify_tags, fact_time, hay_of)
 
 OPS_FILE = "fact_ops.json"
 _OPS_VERSION = 1
@@ -192,20 +193,33 @@ def _entry_fields(body):
         topics.append(parsed["topic"])
     head = str(parsed.get("topic") or "")[:60]
     summary = str(parsed.get("fact") or "")[:300]
-    hay = " ".join([head, summary, body, " ".join(people + topics + things)]).lower()
-    return {
+    # 编辑后按统一分类重算全部标签列：共同主体／待分类不能沿用旧正文的残留（R03）
+    clean = classify_tags({"people": people, "topics": topics, "things": things})
+    hay = hay_of({"head": head, "summary": summary}, clean)
+    fields = {
         "head": head, "summary": summary, "hay": hay,
-        "people": "|".join(people), "topics": "|".join(topics), "things": "|".join(things),
+        "people": "|".join(clean["people"]), "topics": "|".join(clean["topics"]),
+        "things": "|".join(clean["things"]), "shared": "|".join(clean["shared"]),
+        "pending": "|".join(clean["pending"]),
     }
+    # 编辑后的正文可能改了日期：条目日期跟着正文走，重建/画像/去重口径才一致
+    day, clock = fact_time(parsed.get("date"))
+    if day:
+        fields["date"] = day
+        fields["time"] = clock
+    return fields
 
 
 def _write_row(c, entry_id, body, retired, retired_at):
     fields = _entry_fields(body)
     c.execute(
-        "UPDATE entries SET body=?,head=?,summary=?,hay=?,text_hash=?,people=?,topics=?,things=? "
-        "WHERE id=?",
+        "UPDATE entries SET body=?,head=?,summary=?,hay=?,text_hash=?,people=?,topics=?,things=?,"
+        "people_shared=?,people_pending=?,"
+        "date=COALESCE(?,date),time=COALESCE(?,time) WHERE id=?",
         (body, fields["head"], fields["summary"], fields["hay"], body_version(body),
-         fields["people"], fields["topics"], fields["things"], entry_id),
+         fields["people"], fields["topics"], fields["things"],
+         fields["shared"], fields["pending"],
+         fields.get("date"), fields.get("time"), entry_id),
     )
     if retired:
         c.execute("UPDATE entries SET retired=1,retired_at=COALESCE(retired_at,?) WHERE id=?",

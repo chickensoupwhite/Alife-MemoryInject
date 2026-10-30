@@ -5,7 +5,7 @@ using System.ComponentModel;
 namespace Mao.MemoryRecall;
 
 /// <summary>
-/// Mao.MemoryInject —— 记忆回忆提示配置。
+/// Mao.MemoryInject —— Retromem 溯忆配置。
 /// 平时照旧在后台检索记忆目录；命中相关旧账时不塞内容，只追加一句给 AI 自己的提示。
 /// </summary>
 public class MemoryInjectConfig
@@ -14,24 +14,44 @@ public class MemoryInjectConfig
     [Description("是否在后台检索记忆，并在命中时追加一句提示。")]
     public bool Enable { get; set; } = true;
 
-    [DisplayName("启用召回入口门控")]
-    [Description("仅控制自动召回是否进入新增门控；关闭时保持 4.8.7 的入口行为。主动记忆工具不受此开关影响。")]
-    public bool RecallGateEnable { get; set; } = false;
+    [DisplayName("智能召回判断")]
+    [Description("默认开启。先判断当前消息是否需要查找旧记忆，减少闲聊和简短应答触发的自动召回。关闭后按原有方式触发。主动记忆工具不受影响。")]
+    public bool RecallGateEnable { get; set; } = true;
 
-    [DisplayName("启用出口过滤与话题断层")]
-    [Description("开启后，自动召回先按话题变化清理当前窗口，再执行出口过滤与重复压制；关闭时保持旧行为。主动记忆工具不受此开关影响。")]
-    public bool RecallFilterEnable { get; set; } = false;
+    [DisplayName("话题切换与重复提醒控制")]
+    [Description("默认开启。切换话题时重置近期记忆提醒记录，并过滤自动召回结果，减少重复提醒。关闭后按原有方式处理。主动记忆工具不受影响。")]
+    public bool RecallFilterEnable { get; set; } = true;
 
     [DisplayName("统计采集起始时间（UTC）")]
     [Description("调用统计的可证明起点，使用 ISO 8601 UTC 文本保存。留空表示尚未接入统计；不能用文件修改时间推测历史调用。")]
     public string StatisticsStartTimeUtc { get; set; } = "";
 
     [DisplayName("使用语义检索")]
-    [Description("默认关闭。开启后仅对关键词已命中的候选做语义重排；不会用向量单独制造命中。模型没就绪时退回关键词匹配。")]
-    public bool UseSemantic { get; set; } = false;
+    [Description("默认开启。从有效事实向量缓存中找候选，与关键词结果合并后交给本地精排。缓存未覆盖的事实仍可通过关键词查找。")]
+    public bool UseSemantic { get; set; } = true;
+
+    [DisplayName("全库向量候选下限")]
+    [Description("精排前的向量粗筛下限，默认 0.4。候选仍需通过人物、主题、时间及精排筛选；不是正确概率。")]
+    public double VectorMinScore { get; set; } = 0.4;
+
+    [DisplayName("本地相关性精排")]
+    [Description("默认开启。使用随包 MiniLM INT8 判断问题与候选事实的相关性。模型不可用或关闭时回到关键词候选，向量独有候选不自动注入。")]
+    public bool UseReranker { get; set; } = true;
+
+    [DisplayName("精排模型目录")]
+    [Description("留空使用插件 models/reranker。可指定本地兼容 MiniLM ONNX 模型目录，无需 API。")]
+    public string RerankModelPath { get; set; } = "";
+
+    [DisplayName("精排相关性下限")]
+    [Description("精排模型归一化分数下限，默认 0.1；不是回答正确概率。低于下限不提示。")]
+    public double RerankMinScore { get; set; } = 0.1;
+
+    [DisplayName("精排等待上限（毫秒）")]
+    [Description("本地自动召回含精排时的等待上限，默认 1200。超时保留原消息，不追加未经筛选的提示。")]
+    public int RerankWaitMs { get; set; } = 1200;
 
     [DisplayName("Python 解释器")]
-    [Description("留空使用 PATH 中的 python。需已安装 torch 与 transformers。建议写绝对路径。")]
+    [Description("留空使用 PATH 中的 python。向量需 torch、transformers；精排需 numpy、onnxruntime、tokenizers（requirements-semantic.txt）。建议写绝对路径。")]
     public string PythonExe { get; set; } = "";
 
     [DisplayName("记忆目录（相对角色目录）")]
@@ -47,11 +67,11 @@ public class MemoryInjectConfig
     public int MaxResults { get; set; } = 3;
 
     [DisplayName("绝对相关度下限")]
-    [Description("本地片段向量检索的余弦下限。建议 0.55。（侧车语义重排用的是下面单独的一项）")]
+    [Description("本地片段向量检索的余弦下限。建议 0.55。（兼容旧配置，当前自动召回不使用本地片段阈值）")]
     public double MinScore { get; set; } = 0.55;
 
     [DisplayName("侧车语义重排阈值")]
-    [Description("开启语义时，只有相似度达到这个值的候选才会得到最高 +25% 的排序加权；不会单独制造命中。建议 0.58。")]
+    [Description("开启语义时，只作用于关键词候选的语义近似排序，默认 0.58；全库候选下限由单独配置控制。")]
     public double SemanticMinScore { get; set; } = 0.58;
 
     [DisplayName("相对相关度阈值（比平均高多少）")]
@@ -63,7 +83,7 @@ public class MemoryInjectConfig
     public double MinScoreKeyword { get; set; } = 0.15;
 
     [DisplayName("忽略最近几天内的文件")]
-    [Description("只作用于自动书签：按条目的日期跳过最近 N 天（不是文件修改时间）；手动调 memrecall/memwhen 永不跳过。0 = 不忽略。默认 1。")]
+    [Description("只作用于自动记忆提示：按条目的日期跳过最近 N 天（不是文件修改时间）；手动调 memrecall/memwhen 永不跳过。0 = 不忽略。默认 1。")]
     public int SkipRecentDays { get; set; } = 1;
 
     [DisplayName("排除的系统短语")]
@@ -106,6 +126,10 @@ public class MemoryInjectConfig
     [Description("后台每隔这么久自动整理一次索引（衰减/清理）。建议 20（约一天一次）。")]
     public int MaintainIntervalHours { get; set; } = 20;
 
+    [DisplayName("允许维护自动软删")]
+    [Description("默认开启，可自行关闭。每日维护会把「从没被访问过、老过 60 天、不像约定」的条目标记为软删；只标记不删文件，可按记录撤回。可在此关闭。")]
+    public bool AllowSoftMaintenance { get; set; } = true;
+
     [DisplayName("启用图谱兜底")]
     [Description("关键词、语义都没命中时，顺着人/事/物的关系链再扩一层找。关了更省、召回更保守。默认开。")]
     public bool UseGraph { get; set; } = true;
@@ -118,9 +142,13 @@ public class MemoryInjectConfig
     [Description("后台每隔这么久检查一次记忆目录：有了新记忆文件就自动并进索引，不用手动点重建。建议 10。")]
     public int AutoOrganizeMinutes { get; set; } = 10;
 
+    [DisplayName("官方记忆只读层级（逗号分隔）")]
+    [Description("官方 Memory 目录默认只扫描 L1 与 L100：L2–L6 是 L1 的压缩档，重复读进来会让召回、图谱权重和画像证据被放大。留空=扫描所有层级；只影响官方来源，插件自己的 MemoryFacts 不受限制。")]
+    public string SourceLayers { get; set; } = "L1,L100";
+
     [DisplayName("排除的记忆来源（每行一个）")]
-    [Description("相对路径或目录前缀，例如 L1/ 排掉整个 L1；L1/xxx.txt 排掉单个文件。默认排除 L1/ 以避免首次索引过大。官方文件不会被删除，只是不进我们的索引。")]
-    public string ExcludeSources { get; set; } = "L1/";
+    [Description("相对路径或目录前缀，例如 L1/ 排掉整个 L1；L1/xxx.txt 排掉单个文件。默认不排除（官方层级范围由「官方记忆只读层级」控制）。官方文件不会被删除，只是不进我们的索引。")]
+    public string ExcludeSources { get; set; } = "";
 
     /// <summary>默认规则迁移版本；升级时仅在用户仍使用旧默认空值时自动应用推荐排除规则。</summary>
     public int DefaultsMigrationVersion { get; set; } = 0;
@@ -163,7 +191,7 @@ public class MemoryInjectConfig
 
     [DisplayName("工具结果回显到聊天框")]
     [Description("打开后，工具查到的内容也会 Poke 进聊天框（截断到 400 字）。模型同轮已能拿到返回值，这主要是给人看的。建议开。")]
-    public bool EchoToolResult { get; set; } = false;
+    public bool EchoToolResult { get; set; } = true;
 
     [DisplayName("事实合并阈值")]
     [Description("新事实与已有事实（同主体同类别）相似度达到这里就合并，低于则新增。0.5 左右比较合适。")]
@@ -205,7 +233,7 @@ public class MemoryInjectConfig
     [DisplayName("提示文本")]
     [Description("命中后追加到消息末尾的提示。{n} 命中条数、{files} 命中文件、{path} 记忆目录。")]
     public string HintTemplate { get; set; } =
-        "[回忆提示：Memory 里可能有 {n} 条旧账跟这句相关（{files}）。要查往事就调记忆工具（别用 python/别扫盘）：" +
-        "<memrecall query=\"关键词\"/> 查书签、<memfetch source=\"出处文件名\"/> 取原文、" +
+        "[Retromem 溯忆：事实库里可能有 {n} 条旧账跟这句相关（{files}）。要查往事就调记忆工具（别用 python/别扫盘）：" +
+        "<memrecall query=\"关键词\"/> 检索事实卡、<memfetch source=\"出处文件名\"/> 取原文、" +
         "<memwhen time=\"上周三\"/> 按时间翻；工具都查不到就直说没查到，不要编。]";
 }

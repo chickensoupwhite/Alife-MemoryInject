@@ -1,0 +1,5 @@
+Model: cross-encoder/mmarco-mMiniLMv2-L12-H384-v1
+Revision: 1427fd652930e4ba29e8149678df786c240d8825
+License: Apache-2.0
+Source: https://huggingface.co/cross-encoder/mmarco-mMiniLMv2-L12-H384-v1
+Selected artifact: onnx/model_quint8_avx2.onnx (official INT8 export).

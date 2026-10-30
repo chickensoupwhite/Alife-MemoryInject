@@ -8,8 +8,10 @@
 import datetime
 import io
 import json
+import os
 
 import dbside
+import profile_ops
 from state import _DB_SCHEMA, _warn
 
 
@@ -17,17 +19,26 @@ def _now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def _portrait_settings(c):
+    database = c.execute('PRAGMA database_list').fetchone()[2]
+    return profile_ops.load(os.path.join(os.path.dirname(database), 'index.json')) if database else {'aliases': {}, 'hidden': []}
+
+
 def _facts_for_person(c, name):
     """该人物当前有效的事实卡（排除 retired、限于事实卡来源）。"""
     if not name:
         return []
-    pattern = "%|" + str(name).strip() + "|%"
+    settings = _portrait_settings(c)
+    name = profile_ops.canonical(settings, name)
+    if profile_ops.hidden(settings, 'person', name):
+        return []
+    names = profile_ops.family(settings, name)
     rows = c.execute(
         "SELECT id, body, summary, source, text_hash, date "
         "FROM entries WHERE COALESCE(retired,0)=0 "
-        "AND ('|' || COALESCE(people,'') || '|') LIKE ? "
+        "AND (" + ' OR '.join("instr('|' || COALESCE(people,'') || '|',?)>0" for _ in names) + ") "
         "ORDER BY date DESC, time DESC",
-        (pattern,),
+        ['|' + item + '|' for item in names],
     ).fetchall()
     facts = []
     for row in rows:

@@ -16,6 +16,7 @@ import impression
 from dbside import _db_rebuild_links, _db_sync_call_aggregates, _db_upsert
 from state import _GRAPH, _IDX, _NEG, _warn
 from textsim import _audit_card_id, _fact_files, _parse_fact, _sim, _split_blocks, _tag, _tokens
+from textsim import fact_date_key, fact_time, looks_like_state
 # <<< WP1 导入
 
 def _audit_load_state(index_path):
@@ -116,7 +117,12 @@ def _audit_target_card_identity(path, source, line):
     return match if match is not None else (None, None)
 
 
-def _audit_fact_records(memdir, index_path="", max_facts=400):
+def _audit_fact_records(memdir, index_path="", max_facts=400, offset=0, coverage=None):
+    """读取候选事实卡；默认只看最新的一窗，coverage 回报实际扫描范围（R10）。
+
+    offset 表示"已经看过的最新 N 条"，用于继续向更早的记录扫描：
+    窗口为 records[total-offset-max_facts : total-offset]，一次不会被全库拖死。
+    """
     state = _audit_load_state(index_path) if index_path else {
         "retired": {}, "merged": [], "resolved": {}, "operations": {},
         "pending_proposals": [], "accepted_sources": {}, "accepted_provenance": {}}
@@ -205,8 +211,47 @@ def _audit_fact_records(memdir, index_path="", max_facts=400):
             "line_number": 0, "line": line,
             "provenance": list(merged.get("provenance") or []), "virtual": True,
         })
-    if len(records) > int(max_facts):
-        records = records[-int(max_facts):]
+    if index_path:
+        import maintenance
+        maintained = maintenance.load_state(os.path.dirname(os.path.abspath(index_path)))
+        by_entry = {str(r.get("entry_id") or r["id"]): r for r in records}
+        def content_version(record):
+            return hashlib.sha1(re.sub(r"\s+", "", str(record.get("line") or "")).encode("utf-8")).hexdigest()[:16]
+        def hidden(record):
+            eid = str(record.get("entry_id") or record["id"])
+            version = content_version(record)
+            for key in ("retired", "purged"):
+                decision = maintained.get(key, {}).get(eid)
+                if decision and ((key == "retired" and not decision.get("version"))
+                                 or str(decision.get("version") or "") == version):
+                    return True
+            decision = maintained.get("merged", {}).get(eid)
+            if decision and str(decision.get("version") or "") == version:
+                parent = by_entry.get(str(decision.get("parent") or ""))
+                if parent and content_version(parent) == str(decision.get("parent_version") or version):
+                    return True
+            return False
+        records = [record for record in records if not hidden(record)]
+    total = len(records)
+    try:
+        offset = max(0, int(offset or 0))
+        cap = max(1, total) if max_facts is None else max(1, int(max_facts))
+    except (TypeError, ValueError):
+        offset, cap = 0, 400
+    end = max(0, total - offset)
+    start = max(0, end - cap)
+    records = records[start:end]
+    if coverage is not None:
+        coverage.update({
+            "total": total,
+            "scanned": len(records),
+            "offset": offset,
+            "max_facts": cap,
+            # 更早还有没看过的记录：不能把"本窗没有候选"说成"全库没有问题"
+            "truncated": start > 0,
+            "remaining": start,
+            "next_offset": (offset + len(records)) if start > 0 else None,
+        })
     return records, state
 
 
@@ -216,9 +261,80 @@ def _audit_issue_id(kind, cards):
     return "ai:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
-def audit_scan(memdir, limit=30, dup=0.85, near=0.5, max_facts=400, index_path=""):
+def _expiry_candidate(a, b, kind, same_key):
+    """近似内容里「旧值可能已过期」的那一对。
+
+    三条同时满足才升级：同人同主题、日期可比较且不同、较新的一侧是现态。
+    只改提示类型，不改合并语义——这类候选不自动执行、不提供合并正文，
+    人工确认的动作是「退役旧卡」，仍可撤回。事件类事实一律不受影响。
+
+    返回 (kind, older_card)；不是过期对就原样返回 (kind, None)。
+    """
+    if not same_key or kind not in ("重复", "可能重复"):
+        return kind, None
+    key_a, key_b = fact_date_key(a.get("date")), fact_date_key(b.get("date"))
+    if key_a is None or key_b is None or key_a == key_b:
+        return kind, None
+    newer, older = (a, b) if key_a > key_b else (b, a)
+    if not looks_like_state(newer.get("topic"), newer.get("fact")):
+        return kind, None
+    return "疑似过期", older
+
+
+_KIND_RANK = {"疑似过期": 0, "重复": 1}
+
+# 页面看到的是"某一窗"的候选；提交时必须能在同一窗里重新定位，不能只重扫最新 1000 条
+# （5.1.2 复核 S02）。这里缓存 issue_id → 窗口，供 audit_apply 复算；进程重启后失效时
+# 再按请求里的 offset 或逐个旧窗兜底。
+_AUDIT_WINDOWS = {}
+_AUDIT_WINDOW_TTL = 3600
+_AUDIT_WINDOW_MAX = 4000
+
+_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def _key_fact_difference(a, b):
+    """文本高度相似但关键事实不同：否定极性或数字不一致，返回原因（无差异返回 ""）。
+
+    只改候选类型，不判断谁对谁错：这种对必须留给人工，不能因为相似度高就自动合并
+    （5.1.1 复核 R01：长句只多一个"不"也可能被判成 0.93 的重复）。
+    """
+    fa = str(a.get("fact") or "")
+    fb = str(b.get("fact") or "")
+    if any(word in fa for word in _NEG) != any(word in fb for word in _NEG):
+        return "否定表达不同"
+    if sorted(_NUMBER_RE.findall(fa)) != sorted(_NUMBER_RE.findall(fb)):
+        return "关键数字不同"
+    return ""
+
+
+def _proposal_relation(a, b, dup=0.85, near=0.5):
+    same_key = (a["who"] == b["who"]
+                and a["topic"] == b["topic"])
+    sim = _sim(a.get('_tokens') or _tokens(a['fact']), b.get('_tokens') or _tokens(b['fact']))
+    kind = None
+    if sim >= float(dup):
+        kind = "重复"
+    elif same_key and sim >= float(near):
+        kind = "可能重复"
+    elif same_key and str(a.get("date") or "") == str(b.get("date") or ""):
+        proposal_negative = any(w in a["fact"] for w in _NEG)
+        fact_negative = any(w in b["fact"] for w in _NEG)
+        if proposal_negative != fact_negative:
+            kind = "可能矛盾"
+    kind, expired_card = _expiry_candidate(a, b, kind, same_key)
+    # 关键事实差异先于"重复"：只有已经被判成"疑似过期"的状态更替可以保留，
+    # 其余相似但否定/数字不同的对必须留给人工（R01）
+    if kind != "疑似过期" and same_key and sim >= float(near) \
+            and _key_fact_difference(a, b):
+        kind = "可能矛盾"
+    return kind, expired_card
+
+
+def audit_scan(memdir, limit=30, dup=0.85, near=0.5, max_facts=400, index_path="",
+               offset=0, coverage=None, only_issue="", pair_ids=None):
     """Find fact-card candidates with stable IDs and versions; never changes cards."""
-    facts, state = _audit_fact_records(memdir, index_path, max_facts)
+    facts, state = _audit_fact_records(memdir, index_path, max_facts, offset, coverage)
     out = []
     # A model proposal is not an active fact card yet, but it can still repeat
     # an existing card.  Surface that pair as an ordinary audit candidate so
@@ -244,23 +360,21 @@ def audit_scan(memdir, limit=30, dup=0.85, near=0.5, max_facts=400, index_path="
                               "mark_source": str(proposal.get("mark_source") or "")})
     for proposal_card in pending_cards:
         proposal_id = str(proposal_card.get("id") or "")
-        for fact in facts:
-            same_key = (proposal_card["who"] == fact["who"]
-                        and proposal_card["topic"] == fact["topic"])
-            sim = _sim(_tokens(proposal_card["fact"]), _tokens(fact["fact"]))
-            kind = None
-            if sim >= float(dup):
-                kind = "重复"
-            elif same_key and sim >= float(near):
-                kind = "可能重复"
-            elif same_key and str(proposal_card.get("date") or "") == str(fact.get("date") or ""):
-                proposal_negative = any(w in proposal_card["fact"] for w in _NEG)
-                fact_negative = any(w in fact["fact"] for w in _NEG)
-                if proposal_negative != fact_negative:
-                    kind = "可能矛盾"
+        if pair_ids is not None and proposal_id not in pair_ids:
+            continue
+        pending_record = next((p for p in state.get('pending_proposals', []) if p.get('id') == proposal_id), {})
+        proposal_facts = facts
+        if pending_record.get('auto_review') and max_facts is not None:
+            proposal_facts, _ = _audit_fact_records(memdir, index_path, max_facts=None)
+        for fact in proposal_facts:
+            kind, expired_card = _proposal_relation(proposal_card, fact, dup, near)
             if not kind:
                 continue
+            same_key = proposal_card['who'] == fact['who'] and proposal_card['topic'] == fact['topic']
+            sim = _sim(_tokens(proposal_card['fact']), _tokens(fact['fact']))
             issue_id = _audit_issue_id(kind, (proposal_card, fact))
+            if only_issue and issue_id != only_issue and only_issue != "ap:" + proposal_id:
+                continue
             if issue_id in state.get("resolved", {}):
                 continue
             cards = []
@@ -269,7 +383,7 @@ def audit_scan(memdir, limit=30, dup=0.85, near=0.5, max_facts=400, index_path="
                     "id", "version", "date", "who", "topic", "fact", "source", "file",
                     "line_number", "line", "entry_id", "provenance", "virtual", "proposal",
                     "mark_source")})
-            merge_allowed = same_key and kind != "可能矛盾"
+            merge_allowed = same_key and kind not in ("可能矛盾", "疑似过期")
             suggestion = ""
             if merge_allowed:
                 date = max(str(fact.get("date") or ""), str(proposal_card.get("date") or ""))
@@ -283,11 +397,13 @@ def audit_scan(memdir, limit=30, dup=0.85, near=0.5, max_facts=400, index_path="
                 "file_a": fact["file"], "file_b": proposal_card["file"],
                 "cards": cards, "merge_allowed": merge_allowed,
                 "accept_allowed": False, "suggestion": suggestion,
+                "supersede_allowed": expired_card is not None,
+                "supersede_card_id": str((expired_card or {}).get("id") or ""),
                 "proposal": True, "proposal_conflict": True,
                 "proposal_source": list(proposal_card.get("provenance") or []),
             })
             conflicted_proposals.add(proposal_id)
-    # Model-generated cards are proposals until a human accepts them. They
+    # Remaining proposals (conflicts or explicit review-only input) wait for a human. They
     # use a span provenance (source + offset/excerpt) when an exact line
     # cannot be established; never present that span as a fabricated line.
     for proposal in state.get("pending_proposals", []):
@@ -298,6 +414,8 @@ def audit_scan(memdir, limit=30, dup=0.85, near=0.5, max_facts=400, index_path="
         if not parsed:
             continue
         pid = str(proposal["id"])
+        if pair_ids is not None and pid not in pair_ids:
+            continue
         card = {**parsed, "id": pid, "version": str(proposal.get("version") or ""),
                 "source": str(proposal.get("target") or ""),
                 "file": str(proposal.get("target") or ""), "line_number": 0,
@@ -307,13 +425,22 @@ def audit_scan(memdir, limit=30, dup=0.85, near=0.5, max_facts=400, index_path="
         if pid in conflicted_proposals:
             continue
         issue_id = "ap:" + pid
+        if only_issue and issue_id != only_issue:
+            continue
         if issue_id in state.get("resolved", {}):
             continue
         out.append({"issue_id": issue_id, "kind": "新事实待确认", "score": 0.0,
                     "a": line, "b": "", "file_a": card["source"], "file_b": "",
                     "cards": [card], "merge_allowed": False, "accept_allowed": True,
                     "suggestion": line, "proposal": True,
-                    "proposal_source": list(proposal.get("provenance") or [])})
+                    "proposal_source": list(proposal.get("provenance") or []),
+                    "review_peers": [peer for peer in pending_cards if peer['id'] != pid
+                                     and _proposal_relation(card, peer)[0]],
+                    "review_reason": str(proposal.get('review_reason') or '')})
+    # 提交已有双卡候选时，只比较请求指向的两张有效卡。正文、版本和候选类型
+    # 仍从当前投影重新读取和计算；提案与已有事实的冲突检查保持完整。
+    if pair_ids is not None:
+        facts = [fact for fact in facts if str(fact.get("id") or "") in pair_ids]
     n = len(facts)
     cap = max(1, int(limit)) * 3
     for i in range(n):
@@ -333,9 +460,17 @@ def audit_scan(memdir, limit=30, dup=0.85, near=0.5, max_facts=400, index_path="
                 nb = any(w in b["fact"] for w in _NEG)
                 if na != nb:
                     kind = "可能矛盾"
+            kind, expired_card = _expiry_candidate(a, b, kind, same_key)
+            # 关键事实差异先于"重复"：长句多一个否定、数字不同，都必须留给人工（R01）。
+            # 已被判成"疑似过期"的状态更替保持原类型（同样不自动合并、只提示退役旧卡）。
+            if kind != "疑似过期" and same_key and sim >= float(near) \
+                    and _key_fact_difference(a, b):
+                kind = "可能矛盾"
             if not kind:
                 continue
             issue_id = _audit_issue_id(kind, (a, b))
+            if only_issue and issue_id != only_issue:
+                continue
             if issue_id in state.get("resolved", {}):
                 continue
             cards = []
@@ -344,7 +479,7 @@ def audit_scan(memdir, limit=30, dup=0.85, near=0.5, max_facts=400, index_path="
                     "id", "version", "date", "who", "topic", "fact", "source", "file",
                     "line_number", "line", "entry_id", "provenance", "virtual")})
             suggestion = ""
-            merge_allowed = same_key and kind != "可能矛盾"
+            merge_allowed = same_key and kind not in ("可能矛盾", "疑似过期")
             if merge_allowed:
                 date = max(str(a.get("date") or ""), str(b.get("date") or ""))
                 text = a["fact"] if len(a["fact"]) >= len(b["fact"]) else b["fact"]
@@ -353,11 +488,103 @@ def audit_scan(memdir, limit=30, dup=0.85, near=0.5, max_facts=400, index_path="
                 "issue_id": issue_id, "kind": kind, "score": round(sim, 3),
                 "a": a["line"], "b": b["line"], "file_a": a["file"], "file_b": b["file"],
                 "cards": cards, "merge_allowed": merge_allowed, "suggestion": suggestion,
+                "supersede_allowed": expired_card is not None,
+                "supersede_card_id": str((expired_card or {}).get("id") or ""),
             })
             if len(out) >= cap:
                 break
-    out.sort(key=lambda x: (0 if x.get("proposal") else 1, 0 if x["kind"] == "重复" else 1, -x["score"]))
+    out.sort(key=lambda x: (0 if x.get("proposal") else 1,
+                            _KIND_RANK.get(x["kind"], 2), -x["score"]))
+    if only_issue:
+        return out[:1]
     return out[:max(1, int(limit))]
+
+
+def _remember_windows(index_path, issues, offset, max_facts):
+    if not index_path:
+        return
+    try:
+        index_path = os.path.abspath(index_path)
+        stamp = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return
+    for issue in issues or []:
+        issue_id = str(issue.get("issue_id") or "")
+        if not issue_id:
+            continue
+        _AUDIT_WINDOWS[issue_id] = {"index": index_path, "offset": max(0, int(offset)),
+                                    "max_facts": max(1, int(max_facts)), "at": stamp}
+    if len(_AUDIT_WINDOWS) > _AUDIT_WINDOW_MAX:
+        for key in sorted(_AUDIT_WINDOWS, key=lambda k: _AUDIT_WINDOWS[k].get("at", 0))[
+                :len(_AUDIT_WINDOWS) - _AUDIT_WINDOW_MAX]:
+            _AUDIT_WINDOWS.pop(key, None)
+
+
+def _cached_window(index_path, issue_id):
+    item = _AUDIT_WINDOWS.get(issue_id)
+    if not isinstance(item, dict):
+        return None
+    if str(item.get("index") or "") != os.path.abspath(index_path):
+        return None
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    if now - float(item.get("at") or 0) > _AUDIT_WINDOW_TTL:
+        _AUDIT_WINDOWS.pop(issue_id, None)
+        return None
+    return int(item.get("offset") or 0), int(item.get("max_facts") or 400)
+
+
+def _locate_issue(factsdir, index_path, issue_id, req):
+    """按缓存窗口、请求窗口、默认窗口、旧窗兜底的顺序重新定位候选。
+
+    每次都重新读取事实卡并重算 issue_id；版本仍由调用方逐张卡核对，防篡改语义不变。
+    """
+    windows = []
+    cached = _cached_window(index_path, issue_id)
+    if cached:
+        windows.append(cached)
+    try:
+        if req.get("offset") is not None:
+            windows.append((max(0, int(req.get("offset") or 0)),
+                            max(1, int(req.get("max_facts") or 400))))
+    except (TypeError, ValueError):
+        pass
+    windows.append((0, 1000))
+    seen = set()
+    for offset, max_facts in windows:
+        if (offset, max_facts) in seen:
+            continue
+        seen.add((offset, max_facts))
+        rows = audit_scan(factsdir, dup=0.85, near=0.5, max_facts=max_facts,
+                          index_path=index_path, offset=offset, only_issue=issue_id)
+        if rows:
+            return rows[0]
+    # 进程重启/cache 过期：继续向更早的窗口找，最多再看 4 窗（不扩成全库穷举）
+    offset = 1000
+    for _ in range(4):
+        coverage = {}
+        rows = audit_scan(factsdir, dup=0.85, near=0.5, max_facts=1000,
+                          index_path=index_path, offset=offset,
+                          coverage=coverage, only_issue=issue_id)
+        if rows:
+            return rows[0]
+        if not coverage.get("truncated"):
+            break
+        offset += 1000
+    return None
+
+
+def audit_scan_page(memdir, limit=30, dup=0.85, near=0.5, max_facts=400, index_path="",
+                    offset=0):
+    """页面用审计扫描：候选 + 覆盖范围（scanned/total/remaining/next_offset）。
+
+    接口只给候选、不给覆盖信息时，用户无法区分"没有重复"和"根本没扫到"（R10）。
+    """
+    coverage = {}
+    issues = audit_scan(memdir, limit=limit, dup=dup, near=near, max_facts=max_facts,
+                        index_path=index_path, offset=offset, coverage=coverage)
+    _remember_windows(index_path, issues, coverage.get("offset", offset),
+                      coverage.get("max_facts", max_facts))
+    return {"issues": issues, "coverage": coverage}
 
 
 def _audit_plugin_paths(req):
@@ -371,7 +598,7 @@ def _audit_plugin_paths(req):
 
 
 def fact_propose(req):
-    """Queue model output for human confirmation; never writes a fact card."""
+    """Stage model output; auto_accept routes new/duplicate/review cases automatically."""
     try:
         index_path, factsdir = _audit_plugin_paths(req)
     except ValueError as exc:
@@ -413,7 +640,7 @@ def fact_propose(req):
         if prior is not None:
             ids.append(str(prior.get("id")))
             continue
-        raw_id = "%s\0%s\0%s" % (mark_source or target, line_hash, ordinal)
+        raw_id = "%s\0%s\0%s" % (mark_source or target, line_hash, "auto" if req.get("auto_accept") is True else ordinal)
         pid = "ap:" + hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:32]
         # Keep an independent, immutable copy of the input-range metadata on
         # every proposal.  The range identifies what was supplied to the
@@ -441,9 +668,109 @@ def fact_propose(req):
         if pid not in existing:
             state["pending_proposals"].append(item)
             existing[pid] = item
+        existing_by_line[line_hash] = item
         ids.append(pid)
     _audit_save_state(index_path, state)
+    if req.get('auto_accept') is True:
+        return _auto_ingest_proposals(index_path, factsdir, ids)
     return {"ok": True, "proposal_ids": ids, "count": len(ids), "deduplicated": len(ids) != len(clean)}
+
+
+def _auto_ingest_proposals(index_path, factsdir, proposal_ids):
+    """Auto-write new claims, skip exact duplicates, retain explainable review cases."""
+    c = dbside._db_for(index_path)
+    if c is None:
+        return {'error': 'sidecar database unavailable'}
+    active, state = _audit_fact_records(factsdir, index_path, max_facts=None)
+    retired = [_parse_fact(row[0]) for row in c.execute(
+        "SELECT body FROM entries WHERE retired=1 AND lower(replace(source,char(92),'/')) LIKE 'facts/%'")]
+    for card in active:
+        card['_tokens'] = _tokens(card['fact'])
+
+    def proposal_card(proposal):
+        parsed = _parse_fact(proposal['line'])
+        return {**parsed, 'id': proposal['id'], 'version': proposal['version'],
+                'line': proposal['line'], 'source': proposal['target'], 'file': proposal['target'],
+                'provenance': proposal.get('provenance') or [], 'proposal': True,
+                'mark_source': proposal.get('mark_source') or '', 'virtual': True}
+
+    def exact_key(card):
+        return tuple(str(card.get(key) or '').strip() for key in ('date', 'who', 'topic')) + (
+            re.sub(r'\s+', '', str(card.get('fact') or '')),)
+
+    initial = {p['id']: p for p in state.get('pending_proposals', [])}
+    peers = [proposal_card(p) for p in initial.values()]
+    for card in peers:
+        card['_tokens'] = _tokens(card['fact'])
+    unique_ids = list(dict.fromkeys(proposal_ids))
+    written, skipped, already = 0, len(proposal_ids) - len(unique_ids), 0
+    for pid in unique_ids:
+        state = _audit_load_state(index_path)
+        proposal = next((p for p in state['pending_proposals'] if p.get('id') == pid), None)
+        if proposal is None:
+            return {'error': 'proposal changed during automatic ingestion'}
+        card = proposal_card(proposal)
+        card['_tokens'] = _tokens(card['fact'])
+        previous = next((op for op in state.get('operations', {}).values()
+                         if not op.get('undone_at') and any(
+                             item.get('id') == pid and item.get('version') == card['version']
+                             for item in op.get('inputs') or [])), None)
+        if previous is not None:
+            state['pending_proposals'] = [p for p in state['pending_proposals'] if p.get('id') != pid]
+            _audit_save_state(index_path, state)
+            already += 1
+            continue
+        duplicate = next((fact for fact in active if exact_key(fact) == exact_key(card)), None)
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        clean_card = {key: value for key, value in card.items() if key != '_tokens'}
+        issue_id = 'ap:' + pid
+        operation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, 'retromem:auto:' + pid + ':' + card['version']))
+        if duplicate is not None:
+            _audit_consume_proposals(state, [clean_card], operation_id, now, 'skip_duplicate')
+            state['resolved'][issue_id] = {'action': 'skip_duplicate', 'operation_id': operation_id, 'created_at': now}
+            state['operations'][operation_id] = {
+                'operation_id': operation_id, 'action': 'skip_duplicate', 'issue_id': issue_id,
+                'inputs': [clean_card], 'created_at': now, 'source': 'automatic',
+                'result': {'id': duplicate['id']}, 'reason': 'same date, subject, topic and normalized fact'}
+            _audit_save_state(index_path, state)
+            skipped += 1
+            continue
+        if any(fact and exact_key(fact) == exact_key(card) for fact in retired):
+            proposal['auto_review'] = True
+            proposal['review_reason'] = '与已退役事实完全相同，不自动恢复，请人工核对'
+            _audit_save_state(index_path, state)
+            continue
+        active_conflict = any(_proposal_relation(card, fact)[0] for fact in active)
+        pending_conflict = any(peer['id'] != pid and exact_key(peer) != exact_key(card)
+                               and _proposal_relation(card, peer)[0] for peer in peers)
+        if active_conflict or pending_conflict:
+            proposal['auto_review'] = True
+            proposal['review_reason'] = '与有效事实近似或冲突' if active_conflict else '与同批或其他待审提案近似或冲突'
+            _audit_save_state(index_path, state)
+            continue
+        issue = {'issue_id': issue_id, 'proposal': True, 'cards': [clean_card]}
+        snapshot = {'action': 'accept', 'issue_id': issue_id, 'card_id': '',
+                    'versions': {pid: card['version']}, 'merged': '', 'source': 'automatic'}
+        result = _accept_proposal(c, index_path, factsdir, state, issue, snapshot,
+                                  operation_id, now, rebuild_links=False, existing_facts=active)
+        if not result.get('ok'):
+            return result
+        identity = result['operation']['result']
+        active.append({**card, 'id': identity['id'], 'version': identity['version'],
+                       'source': 'facts/' + proposal['target'], 'proposal': False})
+        written += 1
+    if written or skipped or already:
+        _db_rebuild_links(c)
+        _db_sync_call_aggregates(c)
+        c.commit()
+    state = _audit_load_state(index_path)
+    pending = [pid for pid in unique_ids if any(p.get('id') == pid for p in state['pending_proposals'])]
+    source = str((initial.get(unique_ids[0]) or {}).get('mark_source') or '') if unique_ids else ''
+    return {'ok': True, 'proposal_ids': pending, 'count': len(pending),
+            'auto_written': written, 'auto_skipped': skipped, 'already_processed': already,
+            'pending_count': len(pending), 'processed_count': len(proposal_ids),
+            'source_accepted': bool(source and source in state.get('accepted_sources', {}) and not any(
+                p.get('mark_source') == source for p in state['pending_proposals']))}
 
 
 def proposal_status(req):
@@ -477,7 +804,7 @@ def proposal_status(req):
 
 
 def _audit_consume_proposals(state, cards, operation_id, now, action):
-    """Remove proposal inputs once a human resolves them without writing them."""
+    """Remove resolved proposal inputs without writing them, retaining source completion."""
     proposal_cards = [card for card in cards if card.get("proposal")]
     if not proposal_cards:
         return
@@ -497,13 +824,165 @@ def _audit_consume_proposals(state, cards, operation_id, now, action):
         # A merge retains the proposal's claim in a reviewed fact card. A
         # keep/soft-delete action discards it, so that source must not be
         # reported as accepted or allowed to advance compaction markers.
-        if not remaining_source and action == "merge":
+        if not remaining_source and action in ("merge", "skip_duplicate"):
             state.setdefault("accepted_sources", {})[mark_source] = {
                 "operation_id": operation_id,
                 "proposal_id": str(proposal_card.get("id") or ""),
                 "action": action,
                 "accepted_at": now,
             }
+
+
+def _accept_proposal(c, index_path, factsdir, state, issue, request_snapshot, operation_id, now,
+                     rebuild_links=True, existing_facts=None, review_candidates=None):
+    """Shared per-fact file/state/SQLite transaction, with a full active-fact check."""
+    action = 'accept'
+    issue_id = str(issue['issue_id'])
+    cards = issue.get('cards') or []
+    if not issue.get("proposal"):
+        return {"error": "only pending fact proposals can be accepted"}
+    if len(cards) != 1:
+        return {"error": "proposal conflicts with an existing fact; review or merge it first",
+                "conflict": True, "requires_action": "merge",
+                "audit_issue": issue, "candidates": cards}
+    proposal_id = str(cards[0].get("id") or "")
+    proposal = next((p for p in state.get("pending_proposals", [])
+                     if isinstance(p, dict) and str(p.get("id")) == proposal_id), None)
+    if proposal is None:
+        return {"error": "proposal is stale or no longer available", "conflict": True}
+    # A proposal is still subject to the same duplicate/near-duplicate
+    # guard as ordinary audit input.  Re-scan immediately before writing
+    # so a card added after the proposal was generated cannot become a
+    # second active copy.  Same person+topic with materially different
+    # facts remains acceptable; only the explainable audit thresholds
+    # block direct acceptance and route the user to merge/review.
+    parsed_proposal = _parse_fact(str(proposal.get("line") or "").strip())
+    if not parsed_proposal:
+        return {"error": "proposal fact is invalid", "conflict": True}
+    if existing_facts is None:
+        existing_facts, _ = _audit_fact_records(factsdir, index_path, max_facts=None)
+    parsed_proposal['_tokens'] = _tokens(parsed_proposal['fact'])
+    conflicts = []
+    for existing in existing_facts:
+        if str(existing.get("id") or "") == proposal_id:
+            continue
+        kind, _ = _proposal_relation(parsed_proposal, existing)
+        if kind:
+            sim = _sim(_tokens(str(existing.get('fact') or '')), parsed_proposal['_tokens'])
+            conflicts.append({"id": existing.get("id"), "version": existing.get("version"),
+                              "line": existing.get("line"), "score": round(sim, 3),
+                              "kind": kind})
+    if conflicts:
+        # Return the full audit candidate as well as the compact conflict
+        # list.  The HTTP layer can expose this for API clients, while the
+        # management page will refresh and render the same merge action.
+        conflict_issue = next((row for row in review_candidates or [] if row.get('proposal_conflict')
+                               and any(str(card.get('id') or '') == proposal_id for card in row.get('cards') or [])), None)
+        return {"error": "proposal conflicts with an existing fact; review or merge it first",
+                "conflict": True, "requires_action": "merge", "candidates": conflicts,
+                "audit_issue": conflict_issue}
+    target = os.path.basename(str(proposal.get("target") or ""))
+    if not (target.startswith("事实_") and target.endswith(".md")):
+        return {"error": "proposal target is invalid"}
+    target_path = os.path.join(factsdir, target)
+    before_file = None
+    try:
+        if os.path.exists(target_path):
+            with open(target_path, "rb") as fh:
+                before_file = fh.read()
+        line = str(proposal.get("line") or "").strip()
+        previous = before_file.decode("utf-8") if before_file is not None else ""
+        if line not in [x.strip().lstrip("-").strip() for x in previous.splitlines()]:
+            if not previous.strip():
+                previous = "# 事实卡 · %s\n\n" % datetime.date.today().isoformat()
+            if not previous.endswith("\n"):
+                previous += "\n"
+            previous += (line if line.startswith("-") else "- " + line) + "\n"
+            tmp = target_path + ".proposal-" + uuid.uuid4().hex
+            with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(previous)
+                fh.flush(); os.fsync(fh.fileno())
+            os.replace(tmp, target_path)
+        state_path = os.path.join(factsdir, "audit_state.json")
+        try:
+            with open(state_path, "rb") as fh:
+                previous_state = fh.read()
+        except FileNotFoundError:
+            previous_state = None
+        state_saved = False
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            # Add a direct projection for immediate management/graph refresh.
+            parsed = _parse_fact(line)
+            source = "facts/" + target
+            accepted_card_id, accepted_version = _audit_target_card_identity(target_path, source, line)
+            if not accepted_card_id:
+                raise RuntimeError("accepted fact card identity could not be determined")
+            tags = _tag(line)
+            for name, key in ((parsed["who"], "people"), (parsed["topic"], "topics")):
+                if name and name not in tags[key]:
+                    tags[key].append(name)
+            entry_day, entry_clock = fact_time(parsed["date"])
+            entry = {"id": proposal_id, "anchor": hashlib.sha1(line[:80].encode("utf-8")).hexdigest()[:12],
+                     "source": source, "time": entry_clock or str(parsed["date"]) + "T12:00:00",
+                     "date": entry_day or parsed["date"],
+                     "period": "日", "hour": 12, "head": parsed["topic"][:60], "summary": parsed["fact"][:300],
+                     "text": line, "people": tags["people"], "topics": tags["topics"], "things": tags["things"],
+                     "retired": False, "_hash": hashlib.sha1(re.sub(r"\s+", "", line).encode("utf-8")).hexdigest()[:16]}
+            if not _db_upsert(c, entry):
+                raise RuntimeError("failed to index accepted fact proposal")
+            state["pending_proposals"] = [p for p in state.get("pending_proposals", [])
+                                            if not (isinstance(p, dict) and str(p.get("id")) == proposal_id)]
+            mark_source = str(proposal.get("mark_source") or "")
+            remaining_source = any(
+                isinstance(item, dict) and str(item.get("mark_source") or "") == mark_source
+                for item in state.get("pending_proposals", []))
+            if mark_source and not remaining_source:
+                state.setdefault("accepted_sources", {})[mark_source] = {
+                    "operation_id": operation_id, "proposal_id": proposal_id,
+                    "accepted_at": now,
+                }
+            proposal_refs = proposal.get("provenance") if isinstance(proposal.get("provenance"), list) else []
+            if proposal_refs:
+                state.setdefault("accepted_provenance", {})[accepted_card_id] = {
+                    "version": accepted_version,
+                    "provenance": [dict(ref) for ref in proposal_refs if isinstance(ref, dict)],
+                }
+            state["resolved"][issue_id] = {"action": action, "operation_id": operation_id, "created_at": now}
+            operation = {"operation_id": operation_id, "action": action, "issue_id": issue_id,
+                         "inputs": cards, "created_at": now, "source": request_snapshot["source"],
+                         "request": request_snapshot,
+                     "result": {"id": accepted_card_id, "version": accepted_version}}
+            state["operations"][operation_id] = operation
+            # Keep the JSON audit state and SQLite projection in one
+            # recoverable transaction.  The fact file is restored below
+            # if either persistence step fails.
+            _audit_save_state(index_path, state)
+            state_saved = True
+            if rebuild_links:
+                _db_rebuild_links(c)
+                _db_sync_call_aggregates(c)
+            c.commit()
+        except Exception:
+            try:
+                c.rollback()
+            finally:
+                if state_saved:
+                    _audit_restore_state(state_path, previous_state)
+                if before_file is None:
+                    try:
+                        os.remove(target_path)
+                    except FileNotFoundError:
+                        pass
+                else:
+                    _audit_restore_state(target_path, before_file)
+            raise
+        impression.sweep_stale(c)
+        _IDX.update({"data": None, "vocab": None, "df": None})
+        _GRAPH["built"] = False; _GRAPH["nodes"] = {}; _GRAPH["edges"] = {}
+        return {"ok": True, "idempotent": False, "operation": operation}
+    except Exception:
+        raise
 
 
 def audit_apply(req):
@@ -553,8 +1032,21 @@ def audit_apply(req):
             c.rollback()
             raise
         return {"ok": True, "idempotent": True, "operation": prior}
-    candidates = audit_scan(factsdir, limit=400, dup=0.85, near=0.5, max_facts=1000, index_path=index_path)
+    versions = request_snapshot["versions"]
+    targeted = ((issue_id.startswith("ai:") and len(versions) == 2)
+                or (issue_id.startswith("ap:") and len(versions) == 1))
+    if targeted:
+        # 全量读取有效卡，仅复算当前候选：双卡重新确认身份，新事实检查
+        # 全库冲突，均无须比较其他现有事实彼此。旧窗位置漂移也不受影响。
+        candidates = audit_scan(factsdir, dup=0.85, near=0.5, max_facts=None,
+                                index_path=index_path, only_issue=issue_id,
+                                pair_ids=set(versions))
+    else:
+        candidates = audit_scan(factsdir, limit=400, dup=0.85, near=0.5, max_facts=1000, index_path=index_path)
     issue = next((row for row in candidates if row.get("issue_id") == issue_id), None)
+    if issue is None and not targeted:
+        # 旧窗候选：按页面缓存/请求窗口/更早窗口重新定位，而不是固定重扫最新 1000 条（S02）
+        issue = _locate_issue(factsdir, index_path, issue_id, req)
     if issue is None:
         if action == "accept":
             proposal_id = next((str(proposal.get("id") or "")
@@ -577,148 +1069,8 @@ def audit_apply(req):
         return {"error": "fact card version changed; refresh the audit candidate", "conflict": True}
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     if action == "accept":
-        if not issue.get("proposal"):
-            return {"error": "only pending fact proposals can be accepted"}
-        if len(cards) != 1:
-            return {"error": "proposal conflicts with an existing fact; review or merge it first",
-                    "conflict": True, "requires_action": "merge",
-                    "audit_issue": issue, "candidates": cards}
-        proposal_id = str(cards[0].get("id") or "")
-        proposal = next((p for p in state.get("pending_proposals", [])
-                         if isinstance(p, dict) and str(p.get("id")) == proposal_id), None)
-        if proposal is None:
-            return {"error": "proposal is stale or no longer available", "conflict": True}
-        # A proposal is still subject to the same duplicate/near-duplicate
-        # guard as ordinary audit input.  Re-scan immediately before writing
-        # so a card added after the proposal was generated cannot become a
-        # second active copy.  Same person+topic with materially different
-        # facts remains acceptable; only the explainable audit thresholds
-        # block direct acceptance and route the user to merge/review.
-        parsed_proposal = _parse_fact(str(proposal.get("line") or "").strip())
-        if not parsed_proposal:
-            return {"error": "proposal fact is invalid", "conflict": True}
-        existing_facts, _ = _audit_fact_records(factsdir, index_path, max_facts=1000)
-        conflicts = []
-        for existing in existing_facts:
-            if str(existing.get("id") or "") == proposal_id:
-                continue
-            same_key = (existing.get("who") == parsed_proposal.get("who")
-                        and existing.get("topic") == parsed_proposal.get("topic"))
-            sim = _sim(_tokens(str(existing.get("fact") or "")),
-                       _tokens(str(parsed_proposal.get("fact") or "")))
-            if sim >= 0.85 or (same_key and sim >= 0.5):
-                conflicts.append({"id": existing.get("id"), "version": existing.get("version"),
-                                  "line": existing.get("line"), "score": round(sim, 3),
-                                  "kind": "重复" if sim >= 0.85 else "可能重复"})
-        if conflicts:
-            # Return the full audit candidate as well as the compact conflict
-            # list.  The HTTP layer can expose this for API clients, while the
-            # management page will refresh and render the same merge action.
-            conflict_issue = next((row for row in candidates
-                                   if row.get("proposal_conflict")
-                                   and any(str(card.get("id") or "") == proposal_id
-                                           for card in row.get("cards") or [])), None)
-            return {"error": "proposal conflicts with an existing fact; review or merge it first",
-                    "conflict": True, "requires_action": "merge", "candidates": conflicts,
-                    "audit_issue": conflict_issue}
-        target = os.path.basename(str(proposal.get("target") or ""))
-        if not (target.startswith("事实_") and target.endswith(".md")):
-            return {"error": "proposal target is invalid"}
-        target_path = os.path.join(factsdir, target)
-        before_file = None
-        try:
-            if os.path.exists(target_path):
-                with open(target_path, "rb") as fh:
-                    before_file = fh.read()
-            line = str(proposal.get("line") or "").strip()
-            previous = before_file.decode("utf-8") if before_file is not None else ""
-            if line not in [x.strip().lstrip("-").strip() for x in previous.splitlines()]:
-                if not previous.strip():
-                    previous = "# 事实卡 · %s\n\n" % datetime.date.today().isoformat()
-                if not previous.endswith("\n"):
-                    previous += "\n"
-                previous += (line if line.startswith("-") else "- " + line) + "\n"
-                tmp = target_path + ".proposal-" + uuid.uuid4().hex
-                with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-                    fh.write(previous)
-                    fh.flush(); os.fsync(fh.fileno())
-                os.replace(tmp, target_path)
-            state_path = os.path.join(factsdir, "audit_state.json")
-            try:
-                with open(state_path, "rb") as fh:
-                    previous_state = fh.read()
-            except FileNotFoundError:
-                previous_state = None
-            state_saved = False
-            try:
-                c.execute("BEGIN IMMEDIATE")
-                # Add a direct projection for immediate management/graph refresh.
-                parsed = _parse_fact(line)
-                source = "facts/" + target
-                accepted_card_id, accepted_version = _audit_target_card_identity(target_path, source, line)
-                if not accepted_card_id:
-                    raise RuntimeError("accepted fact card identity could not be determined")
-                tags = _tag(line)
-                for name, key in ((parsed["who"], "people"), (parsed["topic"], "topics")):
-                    if name and name not in tags[key]:
-                        tags[key].append(name)
-                entry = {"id": proposal_id, "anchor": hashlib.sha1(line[:80].encode("utf-8")).hexdigest()[:12],
-                         "source": source, "time": str(parsed["date"]) + "T12:00:00", "date": parsed["date"],
-                         "period": "日", "hour": 12, "head": parsed["topic"][:60], "summary": parsed["fact"][:300],
-                         "text": line, "people": tags["people"], "topics": tags["topics"], "things": tags["things"],
-                         "retired": False, "_hash": hashlib.sha1(re.sub(r"\s+", "", line).encode("utf-8")).hexdigest()[:16]}
-                if not _db_upsert(c, entry):
-                    raise RuntimeError("failed to index accepted fact proposal")
-                state["pending_proposals"] = [p for p in state.get("pending_proposals", [])
-                                                if not (isinstance(p, dict) and str(p.get("id")) == proposal_id)]
-                mark_source = str(proposal.get("mark_source") or "")
-                remaining_source = any(
-                    isinstance(item, dict) and str(item.get("mark_source") or "") == mark_source
-                    for item in state.get("pending_proposals", []))
-                if mark_source and not remaining_source:
-                    state.setdefault("accepted_sources", {})[mark_source] = {
-                        "operation_id": operation_id, "proposal_id": proposal_id,
-                        "accepted_at": now,
-                    }
-                proposal_refs = proposal.get("provenance") if isinstance(proposal.get("provenance"), list) else []
-                if proposal_refs:
-                    state.setdefault("accepted_provenance", {})[accepted_card_id] = {
-                        "version": accepted_version,
-                        "provenance": [dict(ref) for ref in proposal_refs if isinstance(ref, dict)],
-                    }
-                state["resolved"][issue_id] = {"action": action, "operation_id": operation_id, "created_at": now}
-                operation = {"operation_id": operation_id, "action": action, "issue_id": issue_id,
-                             "inputs": cards, "created_at": now, "source": request_snapshot["source"],
-                             "request": request_snapshot}
-                state["operations"][operation_id] = operation
-                # Keep the JSON audit state and SQLite projection in one
-                # recoverable transaction.  The fact file is restored below
-                # if either persistence step fails.
-                _audit_save_state(index_path, state)
-                state_saved = True
-                _db_rebuild_links(c)
-                _db_sync_call_aggregates(c)
-                c.commit()
-            except Exception:
-                try:
-                    c.rollback()
-                finally:
-                    if state_saved:
-                        _audit_restore_state(state_path, previous_state)
-                    if before_file is None:
-                        try:
-                            os.remove(target_path)
-                        except FileNotFoundError:
-                            pass
-                    else:
-                        _audit_restore_state(target_path, before_file)
-                raise
-            impression.sweep_stale(c)
-            _IDX.update({"data": None, "vocab": None, "df": None})
-            _GRAPH["built"] = False; _GRAPH["nodes"] = {}; _GRAPH["edges"] = {}
-            return {"ok": True, "idempotent": False, "operation": operation}
-        except Exception:
-            raise
+        return _accept_proposal(c, index_path, factsdir, state, issue, request_snapshot, operation_id, now,
+                                review_candidates=candidates)
     provenance = []
     for card in cards:
         refs = card.get("provenance") or [{"source": card.get("source"), "line_number": card.get("line_number"), "line": card.get("line")}]
@@ -879,6 +1231,24 @@ def audit_history(req):
     return {"ok": True, "records": rows[:limit], "count": len(rows)}
 
 
+def _normalized_fact(card):
+    return re.sub(r"\s+", "", str(card.get("fact") or ""))
+
+
+def _same_content_pair(cards):
+    """自动合并只接受规范化后完全相同的正文。
+
+    相似度只能说明"读起来像"，不能证明两条主张等价：双方都含某个否定词时，
+    "喜欢" 与 "不喜欢" 的相似度仍有 0.93（5.1.2 复核 S01）。这里不再做语义判断，
+    只把自动合并收窄到可证明相同的文本；近似对仍作为人工候选展示。
+    """
+    cards = list(cards or [])
+    return (len(cards) == 2
+            and _normalized_fact(cards[0]) == _normalized_fact(cards[1])
+            # 跨日期的相同正文可能真是不同日子发生的事，自动合并只处理同一天
+            and str(cards[0].get("date") or "") == str(cards[1].get("date") or ""))
+
+
 def audit_auto(req):
     """Automatically merge only high-confidence duplicate candidates.
 
@@ -896,14 +1266,16 @@ def audit_auto(req):
         limit = 20
     applied = []
     warning = ""
+    coverage = {}
     for _ in range(limit):
         state = _audit_load_state(index_path)
         candidates = audit_scan(factsdir, limit=400, dup=0.85, near=0.5,
-                                max_facts=1000, index_path=index_path)
+                                max_facts=1000, index_path=index_path, coverage=coverage)
         issue = next((row for row in candidates
                       if row.get("kind") == "重复" and row.get("merge_allowed")
                       and not row.get("proposal")
                       and not any(card.get("proposal") for card in row.get("cards") or [])
+                      and _same_content_pair(row.get("cards"))
                       and str(row.get("issue_id") or "") not in state.get("auto_suppressed", {})), None)
         if issue is None:
             break
@@ -920,11 +1292,12 @@ def audit_auto(req):
             break
         applied.append(result.get("operation") or {})
     history = audit_history({"index": index_path, "factsdir": factsdir, "limit": 200})
+    remaining_coverage = {}
     remaining = audit_scan(factsdir, limit=100, dup=0.85, near=0.5,
-                           max_facts=1000, index_path=index_path)
+                           max_facts=1000, index_path=index_path, coverage=remaining_coverage)
     return {"ok": True, "applied": len(applied), "operations": applied,
             "records": history.get("records", []), "pending": len(remaining),
-            "warning": warning}
+            "coverage": remaining_coverage, "warning": warning}
 
 
 def _audit_restore_proposal_inputs(state, operation, operation_id, now):
@@ -1057,7 +1430,7 @@ def audit_undo(req):
     return {"ok": True, "idempotent": False, "operation": operation}
 
 
-def _audit_sync_rows(c, index_path, state):
+def _audit_sync_rows(c, index_path, state, maintenance_state=None):
     """Apply durable audit state and manual fact operations as an entries projection.
 
     ★唯一真相是 `fact_ops.projection()`：事实文件 / 合并卡 + 按顺序重放的人工操作。
@@ -1097,7 +1470,8 @@ def _audit_sync_rows(c, index_path, state):
             tags["topics"].append(parsed["topic"])
         entry = {
             "id": merged_id, "anchor": hashlib.sha1(body[:80].encode("utf-8")).hexdigest()[:12],
-            "source": merged["source"], "time": str(parsed["date"]) + "T12:00:00", "date": parsed["date"],
+            "source": merged["source"], "time": fact_time(parsed["date"])[1] or str(parsed["date"]) + "T12:00:00",
+            "date": fact_time(parsed["date"])[0] or parsed["date"],
             "period": "日", "hour": 12, "head": parsed["topic"][:60],
             "summary": parsed["fact"][:300], "text": body, "people": tags["people"],
             "topics": tags["topics"], "things": tags["things"], "retired": False,
@@ -1112,7 +1486,10 @@ def _audit_sync_rows(c, index_path, state):
     for conflict in list(conflicts) + list(replay_conflicts):
         _warn("replay fact operation (%s)" % (conflict.get("reason") or "conflict"),
               RuntimeError(str(conflict.get("fact_id") or "")))
-    return bool(changed or applied)
+    # Every write-side projection must preserve maintenance decisions too.
+    import maintenance
+    maintained = maintenance.apply_state(c, os.path.dirname(os.path.abspath(index_path)), maintenance_state)
+    return bool(changed or applied or any(maintained.get(k) for k in ("retired", "purged", "merged")))
 
 
 def _audit_sync_db(index_path, state):
