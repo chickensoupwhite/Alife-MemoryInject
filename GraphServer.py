@@ -259,7 +259,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(503, {"error": (result or {}).get("error", "refresh failed")})
             return self._json(200, {"ok": True, "name": name, "marked": bool(result.get("marked")),
                                     "note": "已标记过期，下次 AI 调用 mem_impression 时重新生成"})
-        if parsed.path not in ("/audit", "/audit/auto", "/audit/undo", "/fact/edit", "/fact/retire", "/fact/undo") or parsed.query:
+        if parsed.path not in ("/audit", "/audit/auto", "/audit/undo", "/fact/edit",
+                               "/fact/retire", "/fact/undo", "/entity/confirm",
+                               "/entity/reject", "/entity/manage") or parsed.query:
             return self._json(404, {"error": "not found"})
         if not INDEX:
             return self._json(503, {"error": "graph index not configured"})
@@ -279,6 +281,43 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "invalid JSON body"})
         if not isinstance(payload, dict):
             return self._json(400, {"error": "JSON body must be an object"})
+        if parsed.path == '/entity/manage':
+            if set(payload) - {'action', 'name', 'kind', 'target'} or any(not isinstance(value, str) for value in payload.values()):
+                return self._json(400, {'error': 'invalid portrait management fields'})
+            req = dict(payload, id=int.from_bytes(os.urandom(4), 'big'), fn='profilemanage',
+                       index=INDEX, factsdir=os.path.dirname(INDEX))
+            try:
+                with _lock:
+                    result = _request_sidecar(req)
+            except TimeoutError:
+                return self._json(504, {'error': '画像操作超时，请刷新列表核对结果'})
+            except Exception as exc:
+                _log('portrait management failed: %s' % exc)
+                return self._json(503, {'error': '画像管理暂时不可用'})
+            return self._json(200 if result and result.get('ok') else 400,
+                              result or {'error': '画像操作失败'})
+        if parsed.path in ("/entity/confirm", "/entity/reject"):
+            if set(payload) - {"name"} or not isinstance(payload.get("name"), str):
+                return self._json(400, {"error": "name is required"})
+            name = payload["name"].strip()
+            if not name or len(name) > 64:
+                return self._json(400, {"error": "invalid person name"})
+            fn = "peopleconfirm" if parsed.path == "/entity/confirm" else "peoplereject"
+            req = {"id": int.from_bytes(os.urandom(4), "big"), "fn": fn,
+                   "index": INDEX, "factsdir": os.path.dirname(INDEX), "name": name}
+            try:
+                with _lock:
+                    result = _request_sidecar(req)
+            except TimeoutError:
+                return self._json(504, {"error": "person classification timed out"})
+            except Exception as e:
+                _log("backend failure: %s: %s" % (type(e).__name__, e))
+                return self._json(503, {"error": "management service unavailable"})
+            if not result or not result.get("ok"):
+                return self._json(400, {"error": (result or {}).get("error", "classification failed")})
+            return self._json(200, {"ok": True, "name": result.get("name", name),
+                                    "confirmed": result.get("confirmed", []),
+                                    "entries_reclassified": int(result.get("entries_reclassified", 0))})
         if parsed.path == "/audit/auto":
             if set(payload) - {"limit"}:
                 return self._json(400, {"error": "unsupported automatic audit fields"})
@@ -303,6 +342,7 @@ class Handler(BaseHTTPRequestHandler):
                                         if isinstance(result, dict) else "automatic audit failed"})
             return self._json(200, {"ok": True, "applied": int(result.get("applied", 0)),
                                     "records": result.get("records", []),
+                                    "coverage": result.get("coverage", {}),
                                     "warning": str(result.get("warning") or "")})
         if parsed.path == "/audit/undo":
             if set(payload) - {"operation_id"} or not isinstance(payload.get("operation_id"), str):
@@ -410,7 +450,8 @@ class Handler(BaseHTTPRequestHandler):
                 "idempotent": bool(result.get("idempotent", False)),
                 "operation": result.get("operation", {}),
             })
-        allowed_fields = {"action", "operation_id", "issue_id", "card_id", "versions", "merged"}
+        allowed_fields = {"action", "operation_id", "issue_id", "card_id", "versions", "merged",
+                          "offset", "max_facts"}
         if set(payload) - allowed_fields:
             return self._json(400, {"error": "unsupported audit fields"})
         action = payload.get("action")
@@ -437,6 +478,13 @@ class Handler(BaseHTTPRequestHandler):
                        or not isinstance(value, str) or len(value) > 128
                        for key, value in versions.items())):
             return self._json(400, {"error": "invalid versions"})
+        try:
+            window_offset = int(payload.get("offset") or 0)
+            window_max = int(payload.get("max_facts") or 400)
+        except (TypeError, ValueError):
+            return self._json(400, {"error": "invalid audit window"})
+        if window_offset < 0 or window_offset > 1000000 or window_max < 1 or window_max > 2000:
+            return self._json(400, {"error": "invalid audit window"})
         req = {
             "id": int.from_bytes(os.urandom(4), "big"),
             "fn": "auditapply",
@@ -451,6 +499,8 @@ class Handler(BaseHTTPRequestHandler):
             "versions": versions,
             "merged": merged,
             "source": "manual",
+            "offset": window_offset,
+            "max_facts": window_max,
         }
         try:
             with _lock:
@@ -483,6 +533,19 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
+        if path == "/organize/progress":
+            if not INDEX:
+                return self._json(503, {"error": "graph index not configured"})
+            try:
+                snapshot = Path(INDEX).parent / "organize_status.json"
+                payload = json.loads(snapshot.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict) or not isinstance(payload.get("layers"), list) or not isinstance(payload.get("files"), list):
+                    raise ValueError("invalid organize progress")
+            except FileNotFoundError:
+                return self._json(503, {"error": "来源进度尚未生成，请重载插件后从插件打开管理页。"})
+            except (OSError, ValueError):
+                return self._json(503, {"error": "来源进度暂时无法读取，请稍后刷新。"})
+            return self._json(200, {"ok": True, **payload})
         if path == "/impression":
             name = (parse_qs(parsed.query).get("name") or [""])[0]
             if not name.strip():
@@ -523,6 +586,9 @@ class Handler(BaseHTTPRequestHandler):
                         "id": request_id, "fn": "auditscan", "index": INDEX, "readonly": True,
                         "factsdir": os.path.dirname(INDEX),
                         "limit": _int_param(query, "limit", 30, 1, 100),
+                        # 继续扫描必须真的换窗：只给 limit 会一直返回最新 400 条
+                        "offset": _int_param(query, "offset", 0, 0, 1000000),
+                        "max_facts": _int_param(query, "max_facts", 400, 1, 2000),
                         "dup": 0.85,
                         "near": 0.5,
                     }
@@ -560,11 +626,12 @@ class Handler(BaseHTTPRequestHandler):
                     }
                 elif path == "/entities":
                     entity_kind = _param(query, "kind", "person").strip().lower()
-                    if entity_kind not in ("person", "event", "object"):
+                    if entity_kind not in ("person", "event", "object", "pending", "shared"):
                         return self._json(400, {"error": "invalid entity kind"})
                     req = {
                         "id": request_id, "fn": "entities", "index": INDEX, "readonly": True,
                         "kind": entity_kind,
+                        "offset": _int_param(query, "offset", 0, 0, 100000),
                         "limit": _int_param(query, "limit", 60, 1, 200),
                     }
                 else:
@@ -617,6 +684,8 @@ class Handler(BaseHTTPRequestHandler):
                     "count": result.get("count", 0),
                     "issues": result.get("issues", []),
                     "history": result.get("history", []),
+                    # 覆盖范围必须和候选一起返回，否则"没有候选"会被误读成全库没问题（R10）
+                    "coverage": result.get("coverage", {}),
                 })
             if path == "/source":
                 return self._json(200, {"source": req["source"], "text": result.get("text", "")})
@@ -625,7 +694,16 @@ class Handler(BaseHTTPRequestHandler):
                     "kind": result.get("kind", req.get("kind", "person")),
                     "items": result.get("items", []),
                     "total": int(result.get("total", 0)),
+                    "offset": int(result.get("offset", req.get("offset", 0))),
                     "truncated": bool(result.get("truncated", False)),
+                    "has_more": bool(result.get("has_more", False)),
+                    # 待分类／共同主体与人物总数同源，页面底部数量必须能对上（R04）
+                    "pending": result.get("pending", []),
+                    "pending_total": int(result.get("pending_total", 0)),
+                    "shared": result.get("shared", []),
+                    "shared_total": int(result.get("shared_total", 0)),
+                    "note": str(result.get("note", "")),
+                    "management": result.get("management", {}),
                 })
             if path == "/profile":
                 return self._json(200, {
@@ -639,6 +717,7 @@ class Handler(BaseHTTPRequestHandler):
                     "has_more": bool(result.get("has_more", False)),
                     "relations": result.get("relations", []),
                     "relations_complete": bool(result.get("relations_complete", True)),
+                    "summary": result.get("summary", {}),
                     "items": result.get("items", []),
                     "text": result.get("text", ""),
                 })

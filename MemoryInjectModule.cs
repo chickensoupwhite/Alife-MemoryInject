@@ -21,7 +21,7 @@ using Microsoft.SemanticKernel.ChatCompletion;
 namespace Mao.MemoryRecall;
 
 /// <summary>
-/// Mao.MemoryInject —— 记忆回忆提示模块（后台检索·命中才提示）。
+/// Mao.MemoryInject —— Retromem 溯忆模块（后台检索·命中才提示）。
 ///
 /// 铁律（2026-10-05 修）：
 ///   1. 同步钩子 ChatSend 里**绝不无上限等待外部进程**。语义检索只允许
@@ -31,15 +31,16 @@ namespace Mao.MemoryRecall;
 ///   3. 侧车启动/批量向量化一律后台；批量期间 Busy 置位，同步路径直接放过。
 ///   4. 任何异常一律放过原消息，并记日志。
 /// </summary>
-[Module("记忆书签",
-    "主人说话时在后台检索记忆目录，命中旧账只在消息末尾提示一句（不塞内容、不占上下文）；另做流水压缩、事实审计、写入合并与内嵌索引浏览。检索只读，压缩/审计只写事实卡与报告，异常一律放过。",
+[Module("Retromem 溯忆",
+    "以官方记忆为只读整理来源，独立管理事实卡，提供记忆提炼、多路召回、本地精排、关系图谱、人物画像与安全审计的可视化记忆工作台。",
     defaultCategory: "Mao",
     editorUI: typeof(MemoryInjectUI))]
 public class MemoryInjectModule(
     ILogger<MemoryInjectModule> logger,
     XmlFunctionCaller functionCaller,
     Interactor<MemoryInjectModule> interactor,
-    ChatBot chatBot) :
+    ChatBot chatBot,
+    ConfigurationSystem configurationSystem) :
     ChatBehaviour,
     IConfigurable<MemoryInjectConfig>
 {
@@ -154,7 +155,8 @@ public class MemoryInjectModule(
     // ===== 生命周期 =====
 
     DateTime lastMaintain = DateTime.MinValue;
-    DateTime lastLlmOrganize = DateTime.MinValue;   // 上次整理时间；启动冷却由 startedAt/StartupDelay 单独控制
+    DateTime lastVecWarm = DateTime.MinValue;        // 上次触发语义缓存预热（分批，只补缺口）
+    DateTime lastLlmOrganize = DateTime.MinValue;   // 上次成功自动整理；跳过或失败不消耗成功间隔
     DateTime startedAt = DateTime.Now;
     bool llmStartupLogged;
     DateTime lastCompactOk = DateTime.MinValue;     // 上次压缩"健康"完成（扫到清单且没积压/有产出）
@@ -163,17 +165,54 @@ public class MemoryInjectModule(
     volatile bool compacting;                        // 压缩/审计互斥，避免并发重复干活
     volatile bool auditing;
     volatile bool organizing;                      // 手动/自动整理互斥，避免同一批重复喂模型
+    readonly SemaphoreSlim organizeLock = new(1, 1);
     readonly SemaphoreSlim factLock = new(1, 1);      // 事实卡写入串行化（整理与压缩会并发）
     string llmStatePath = "";                        // 记录"已整理到哪个文件/时间"的水位
+    readonly object sourceProgressLock = new();
+    string sourceProgressCache = "", sourceProgressScope = "";
+    DateTime sourceProgressCheckedAt = DateTime.MinValue;
+    Dictionary<string, object?> sourceProgressPayload = new();
+    Timer? sourceProgressTimer;
+    int sourceProgressRefreshing;
 
-    bool migrationsApplied;
+    MemoryInjectConfig? migratedConfiguration;
+    bool migrationSavePending;
+    DateTime lastMigrationSaveAt = DateTime.MinValue;
 
     /// <summary>配置可能晚于 OnAwake 注入：首次拿到 Configuration 时再跑迁移（幂等）。</summary>
     void EnsureMigrations()
     {
-        if (migrationsApplied || Configuration == null) return;
-        migrationsApplied = true;
+        if (Configuration == null || ReferenceEquals(migratedConfiguration, Configuration)) return;
+        int before = Configuration.DefaultsMigrationVersion;
         ApplyDefaultMigrations();
+        migrationSavePending |= Configuration.DefaultsMigrationVersion != before;
+        if (migrationSavePending)
+        {
+            string root = Character?.StorageKey ?? "";
+            if (root.Length == 0)
+            {
+                // 拿不到角色键时不写全局配置，免得把一个角色的配置写到所有人身上
+                logger.LogDebug("Retromem 溯忆：角色键还没就绪，升级配置稍后再存");
+                return;
+            }
+            // 保存失败（磁盘/权限/路径）不要每条消息都重试一遍：10 分钟一次，日志也只报一次
+            if ((DateTime.UtcNow - lastMigrationSaveAt).TotalMinutes < 10) return;
+            lastMigrationSaveAt = DateTime.UtcNow;
+            try
+            {
+                // ★第三参是"存储根目录下的相对 root"，不是绝对路径：传 roleRoot 会拼成
+                //   D:\alife\storage\D:\alife\storage\Character\xxx\Configuration 而失败。
+                //   框架自己的角色键就是 Character.StorageKey（路由插件保存配置也用它）。
+                configurationSystem.SetConfiguration(typeof(MemoryInjectModule), Configuration, root);
+                migrationSavePending = false;
+            }
+            catch (Exception e)
+            {
+                logger.LogWarning(e, "Retromem 溯忆：升级配置保存失败，10 分钟后重试");
+                return;
+            }
+        }
+        migratedConfiguration = Configuration;
     }
 
     // 升级只迁移仍处于旧默认值的配置，保留用户自定义的排除规则。
@@ -187,15 +226,130 @@ public class MemoryInjectModule(
                 Configuration.ExcludeSources = "L1/";
             Configuration.DefaultsMigrationVersion = 1;
             ver = 1;
-            logger.LogInformation("记忆书签：已应用默认规则迁移 v1（原排除规则为空时加入 L1/；用户自定义规则保留）");
+            logger.LogInformation("Retromem 溯忆：已应用默认规则迁移 v1（原排除规则为空时加入 L1/；用户自定义规则保留）");
         }
         if (ver < 2)
         {
-            // v2（vnext）：语义检索默认关闭——旧配置里可能存着 true，这里统一关一次，避免召回被弱相关结果污染。
-            Configuration.UseSemantic = false;
+            // v2：仅推进迁移标记，保留当前语义选择；新配置按默认开启，不再强制关闭。
             Configuration.DefaultsMigrationVersion = 2;
-            logger.LogInformation("记忆书签：已应用默认规则迁移 v2（语义召回默认关闭；需要时可在配置里重新打开）");
+            logger.LogInformation("Retromem 溯忆：已应用默认规则迁移 v2（保留当前语义重排设置）");
         }
+        if (ver < 3)
+        {
+            // v3：官方记忆默认只读 L1/L100。旧默认 ExcludeSources="L1/" 会把白名单里的 L1
+            // 反过来挡住，所以只移除这一个精确 token；用户写的 L1/某文件 等自定义排除保留。
+            string raw = Configuration.ExcludeSources ?? "";
+            var kept = new List<string>();
+            foreach (string part in raw.Split(new[] { '\n', '\r', ',', ';' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string one = part.Trim().Replace('\\', '/').Trim('/');
+                if (string.Equals(one, "L1", StringComparison.OrdinalIgnoreCase)) continue;
+                if (one.Length > 0) kept.Add(part.Trim());
+            }
+            Configuration.ExcludeSources = string.Join("\n", kept);
+            if (string.IsNullOrWhiteSpace(Configuration.SourceLayers))
+                Configuration.SourceLayers = "L1,L100";
+            Configuration.DefaultsMigrationVersion = 3;
+            logger.LogInformation("Retromem 溯忆：已应用默认规则迁移 v3（官方来源默认只扫描 L1/L100；旧默认排除 L1/ 已移除）");
+        }
+        if (ver < 4)
+        {
+            // This release intentionally enables previously-off features once.
+            Configuration.UseSemantic = true;
+            Configuration.AllowSoftMaintenance = true;
+            Configuration.EchoToolResult = true;
+            Configuration.DefaultsMigrationVersion = 4;
+            logger.LogInformation("Retromem：本次升级已开启语义重排、维护软删、工具回显；自动压缩保留原值，之后可自行关闭。");
+        }
+        if (ver < 5)
+        {
+            // 本次升级覆盖 v4 之后保存的关闭值；迁移标记落盘后尊重后续手动选择。
+            Configuration.UseSemantic = true;
+            Configuration.DefaultsMigrationVersion = 5;
+            logger.LogInformation("Retromem 溯忆：本次升级已开启语义检索；升级配置将保存，之后可自行关闭。");
+        }
+    }
+
+    /// <summary>官方记忆允许扫描的层级（空 = 不过滤）。只约束官方来源，插件自己的 MemoryFacts 不受限。</summary>
+    string[] LayerSnapshot()
+    {
+        string raw = Configuration?.SourceLayers ?? "";
+        var list = new List<string>();
+        foreach (string part in raw.Split(new[] { '\n', '\r', ',', ';' }, StringSplitOptions.RemoveEmptyEntries))
+        {
+            string one = part.Trim();
+            if (one.Length > 0) list.Add(one);
+        }
+        return list.Count == 0 ? Array.Empty<string>() : list.ToArray();
+    }
+
+    /// <summary>是不是 L1 / L100 这种层级目录名。按整段判断，绝不把 L1 当成 L100 的前缀。</summary>
+    static bool IsLayerSegment(string segment)
+    {
+        if (string.IsNullOrEmpty(segment) || segment.Length < 2) return false;
+        if (segment[0] != 'L' && segment[0] != 'l') return false;
+        for (int i = 1; i < segment.Length; i++)
+            if (!char.IsDigit(segment[i])) return false;
+        return true;
+    }
+
+    /// <summary>该相对路径是否落在允许的官方层级里。层级目录可能出现在第一段（L5/x），
+    /// 也可能在 Memory/L5/x 里，所以逐段找；不在层级目录下的文件不受约束。</summary>
+    static bool InLayerRange(string rel, string[] layers)
+    {
+        if (layers.Length == 0) return true;
+        string clean = (rel ?? "").Replace('\\', '/').Trim('/');
+        if (clean.Length == 0) return true;
+        string[] parts = clean.Split('/');
+        for (int i = 0; i < parts.Length - 1; i++)
+        {
+            if (!IsLayerSegment(parts[i])) continue;
+            foreach (string name in layers)
+                if (string.Equals(name.Trim(), parts[i], StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+        return true;
+    }
+
+    /// <summary>来源范围的签名：层级白名单 + 排除清单。范围一变就要重建一次，
+    /// 否则升级后旧库还按旧范围（只读 L2–L6）继续用，配置等于没生效。
+    /// scope=facts-v1：索引口径改为"只认事实卡"，旧库（含官方流水）必须重建一次。</summary>
+    string ScopeSignature()
+    {
+        EnsureExcludes();   // 排除清单含"已压缩来源"，没加载就会和写签名时的值不一致 → 反复重建
+        var layers = LayerSnapshot().OrderBy(x => x, StringComparer.OrdinalIgnoreCase);
+        var exclude = ExcludeSnapshot().OrderBy(x => x, StringComparer.OrdinalIgnoreCase);
+        return "scope=facts-v1|layers=" + string.Join(",", layers) + "|exclude=" + string.Join(",", exclude);
+    }
+
+    string ScopeStampPath()
+    {
+        return string.IsNullOrWhiteSpace(factsRoot) ? "" : Path.Combine(factsRoot, "scope_signature.txt");
+    }
+
+    /// <summary>已有库、但范围签名变了（升级或用户改了层级/排除）：需要重建一次。</summary>
+    bool ScopeChanged()
+    {
+        try
+        {
+            string stamp = ScopeStampPath();
+            if (stamp.Length == 0) return false;
+            bool hasStore = File.Exists(indexPath) || File.Exists(Path.Combine(factsRoot, "memory.db"));
+            if (!hasStore) return false;          // 还没建过库：走正常首次建，不算"范围变了"
+            if (!File.Exists(stamp)) return true; // 5.1 之前的库没有签名
+            return File.ReadAllText(stamp).Trim() != ScopeSignature();
+        }
+        catch { return false; }
+    }
+
+    void WriteScopeStamp()
+    {
+        try
+        {
+            string stamp = ScopeStampPath();
+            if (stamp.Length > 0) File.WriteAllText(stamp, ScopeSignature());
+        }
+        catch { }
     }
 
     // 判断目录里有没有记忆文件（.md/.txt，递归；跳过 settled/backup/.bak）
@@ -228,14 +382,14 @@ public class MemoryInjectModule(
             string rel = part.Trim().Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar);
             if (rel.Length == 0 || Path.IsPathRooted(rel))
             {
-                if (rel.Length > 0) logger.LogWarning("记忆书签：忽略角色目录外的记忆来源配置：{Path}", part.Trim());
+                if (rel.Length > 0) logger.LogWarning("Retromem 溯忆：忽略角色目录外的记忆来源配置：{Path}", part.Trim());
                 continue;
             }
             string candidate = Path.GetFullPath(Path.Combine(roleRoot, rel));
             if (candidate.StartsWith(Path.GetFullPath(roleRoot).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
                 candidates.Add(candidate);
             else
-                logger.LogWarning("记忆书签：忽略越过角色根目录的来源配置：{Path}", part.Trim());
+                logger.LogWarning("Retromem 溯忆：忽略越过角色根目录的来源配置：{Path}", part.Trim());
         }
         candidates.Add(Path.Combine(roleRoot, "Memory"));
         candidates.Add(Path.Combine(roleRoot, "Storage/Memory"));
@@ -297,7 +451,7 @@ public class MemoryInjectModule(
         }
         catch (Exception e)
         {
-            logger.LogError(e, "记忆回忆提示：路径初始化失败");
+            logger.LogError(e, "Retromem 溯忆：路径初始化失败");
         }
 
         // 清掉历史换库留下的 swap / 旧备份（每份几十~几百 MB，不清会把盘吃满）
@@ -306,19 +460,19 @@ public class MemoryInjectModule(
         try { MigrateFactCards(); } catch { }
 
         // 本角色有没有记忆文件：没有就别启侧车、别检索（否则会串到别人的索引）
-        try { hasMemory = memoryRoots.Any(x => HasMemoryFiles(x.root)); } catch { hasMemory = false; }
+        try { hasMemory = memoryRoots.Any(x => HasMemoryFiles(x.root)) || HasMemoryFiles(factsRoot); } catch { hasMemory = false; }
 
         try { ChatBot.ChatSend += OnChatSend; }
-        catch (Exception e) { logger.LogError(e, "记忆回忆提示：挂载 ChatSend 失败"); }
+        catch (Exception e) { logger.LogError(e, "Retromem 溯忆：挂载 ChatSend 失败"); }
 
-        // 主动调用的工具（取原文/画像卡/钓欠账/按人事物查书签），隐式注入
+        // 主动调用的工具（取原文/画像卡/钓欠账/按人事物检索事实卡），隐式注入
         try
         {
             XmlHandler handler = new(this)
             {
-                Description = "记忆检索工具：翻自己落盘的旧账。想确认往事、查来龙去脉、按时间找、盘点欠账时，**只能**用这里的工具，" +
+                Description = "Retromem 溯忆记忆工具：翻自己落盘的旧账。想确认往事、查来龙去脉、按时间找、盘点欠账时，**只能**用这里的工具，" +
                               "禁止用 <Python>、读文件、扫目录、sqlite3 去查记忆（既慢又容易读到过期数据）。" +
-                              "memrecall 按人事查书签；memwhen 按时间翻；memfetch 取原文；memprofile 聚画像；memloops 钓欠账；" +
+                              "memrecall 按人事检索事实卡；memwhen 按时间翻；memfetch 取原文；memprofile 聚画像；memloops 钓欠账；" +
                               "memstatus 看索引；memlinks 顺关系；memdebug 解释召回；memcompact 压流水；memaudit 审矛盾；memcleanhistory 只统计历史合成消息（不删除）；" +
                               "memorganize 空闲时小批整理（系统报点/没人说话时，可主动整理一小批未整理的流水）。" +
                               "mem_impression 按人物名取印象摘要；",
@@ -326,7 +480,7 @@ public class MemoryInjectModule(
                     "这些函数：检索类是只读的；压缩/审计只写事实卡与报告，不动原文。" +
                     "★铁律：查记忆只用下面这些工具；禁止用 <Python>、glob、读文件、`sqlite3` 去翻记忆目录或索引库——" +
                     "那属于本工具的职责，绕过工具既慢又容易拿到过期/未整理的数据。" +
-                    "<memrecall query=\"关键词\"/> 查书签；" +
+                    "<memrecall query=\"关键词\"/> 检索事实卡；" +
                     "<memwhen time=\"上周三\" keyword=\"可选\" limit=\"8\"/> 按时间翻旧账；" +
                     "<memfetch source=\"memory_xxx.md\" 或 keyword=\"关键词\" limit=\"3\"/> 取原文；" +
                     "<memprofile who=\"主人/小鲸鱼/俾斯麦/妈\" limit=\"30\"/> 按人聚画像卡；" +
@@ -343,12 +497,12 @@ public class MemoryInjectModule(
         }
         catch (Exception e)
         {
-            logger.LogWarning(e, "记忆回忆提示：XmlHandler 注册失败（角色未启用 FunctionCaller 时属预期）");
+            logger.LogWarning(e, "Retromem 溯忆：XmlHandler 注册失败（角色未启用 FunctionCaller 时属预期）");
         }
 
         // 扫描一次，把记忆目录切成片段（纯文件 IO，不碰网络/进程）
         try { EnsureChunks(force: true); }
-        catch (Exception e) { logger.LogWarning(e, "记忆回忆提示：首次扫描失败"); }
+        catch (Exception e) { logger.LogWarning(e, "Retromem 溯忆：首次扫描失败"); }
 
         // 侧车只在开关打开时启动；重活一律丢后台，绝不在 OnAwake 里等
         // ★B：侧车提供索引召回（主路径），不该被"语义开关"卡住；UseSemantic 只控制向量那一路
@@ -367,19 +521,19 @@ public class MemoryInjectModule(
                         // 大库首次冷读要 2s+，会超出同步等待窗口；预热放到启动后台，不占真查询。
                         try
                         {
-                            await sidecar.AskAsync("warm", new Dictionary<string, object?>(), 120000, indexPath).ConfigureAwait(false);
+                            await sidecar.AskAsync("warm", new Dictionary<string, object?> { ["use_reranker"] = Configuration.UseReranker, ["rerank_model_path"] = Configuration.RerankModelPath }, 120000, indexPath).ConfigureAwait(false);
                             warmDone = true;
                         }
                         catch { }
                         // ★只有开启语义才需要本地片段的向量；关着还算会导致侧车惰性加载模型、
                         //   白编码几千条片段（启动慢 + 吃显存），而且这些向量根本不会被用到。
                         if (Configuration.UseSemantic)
-                            await ComputeVectorsAsync().ConfigureAwait(false);
+                            await sidecar.AskAsync("vecwarm", new Dictionary<string, object?> { ["batch"] = 32, ["limit"] = 0 }, 8000, indexPath).ConfigureAwait(false);
                     }
                 }
                 catch (Exception e)
                 {
-                    logger.LogWarning(e, "记忆回忆提示：向量侧车异常（不影响主流程）");
+                    logger.LogWarning(e, "Retromem 溯忆：向量侧车异常（不影响主流程）");
                 }
             });
         }
@@ -395,17 +549,35 @@ public class MemoryInjectModule(
                     if (sidecar.IsReady && warmDone)
                         await EnsureIndexAsync(force: false).ConfigureAwait(false);
                 }
-                catch (Exception e) { logger.LogWarning(e, "记忆回忆提示：自动整理索引失败（不影响主流程）"); }
+                catch (Exception e) { logger.LogWarning(e, "Retromem 溯忆：自动整理索引失败（不影响主流程）"); }
 
                 try
                 {
                     if (sidecar.IsReady && (DateTime.Now - lastMaintain).TotalHours >= Math.Max(1, Configuration.MaintainIntervalHours))
                     {
-                        sidecar.AskSync("maintain", new Dictionary<string, object?>(), 8000, indexPath);
+                        sidecar.AskSync("maintain", new Dictionary<string, object?>
+                        {
+                            ["allow_soft"] = Configuration.AllowSoftMaintenance
+                        }, 8000, indexPath);
                         lastMaintain = DateTime.Now;
                     }
                 }
-                catch (Exception e) { logger.LogWarning(e, "记忆回忆提示：每日维护失败（不影响主流程）"); }
+                catch (Exception e) { logger.LogWarning(e, "Retromem 溯忆：每日维护失败（不影响主流程）"); }
+
+                // 语义缓存：开启语义才预热，分批补缺口，不阻塞召回（侧车内部后台线程）
+                try
+                {
+                    if (sidecar.IsReady && Configuration.UseSemantic
+                        && (DateTime.Now - lastVecWarm).TotalMinutes >= 30)
+                    {
+                        sidecar.AskSync("vecwarm", new Dictionary<string, object?>
+                        {
+                            ["batch"] = 64, ["limit"] = 2000
+                        }, 8000, indexPath);
+                        lastVecWarm = DateTime.Now;
+                    }
+                }
+                catch (Exception e) { logger.LogWarning(e, "Retromem 溯忆：语义缓存预热失败（不影响召回）"); }
 
                 // 模型整理：新落盘的流水交给模型提炼成事实卡（默认两小时一次，精度比机械切块高）
                 try
@@ -419,16 +591,19 @@ public class MemoryInjectModule(
                         if (!llmStartupLogged)
                         {
                             llmStartupLogged = true;
-                            logger.LogInformation("记忆书签：模型整理启动冷却中，{Minutes} 分钟后才允许自动整理", startupDelay);
+                            logger.LogInformation("Retromem 溯忆：模型整理启动冷却中，{Minutes} 分钟后才允许自动整理", startupDelay);
                         }
                     }
                     else if (intervalDone)
                     {
-                        lastLlmOrganize = DateTime.Now;
-                        await LlmOrganizeAsync().ConfigureAwait(false);
+                        var result = await LlmOrganizeAsync().ConfigureAwait(false);
+                        if (result.files > 0)
+                            lastLlmOrganize = DateTime.Now;
+                        else if (!string.IsNullOrWhiteSpace(result.fact))
+                            logger.LogInformation("Retromem 溯忆：自动整理本轮未推进：{Reason}；下一轮检查重试", result.fact);
                     }
                 }
-                catch (Exception e) { logger.LogWarning(e, "记忆回忆提示：模型整理失败（不影响主流程）"); }
+                catch (Exception e) { logger.LogWarning(e, "Retromem 溯忆：模型整理失败（不影响主流程）"); }
 
                 // ① 自动压缩：流水占索引大头时压成事实卡（默认六小时一次；开关默认关，确认稳了再开）
                 try
@@ -440,7 +615,7 @@ public class MemoryInjectModule(
                         lastCompact = DateTime.Now;
                     }
                 }
-                catch (Exception e) { logger.LogWarning(e, "记忆回忆提示：自动压缩失败（不影响主流程）"); }
+                catch (Exception e) { logger.LogWarning(e, "Retromem 溯忆：自动压缩失败（不影响主流程）"); }
 
                 // ② 审计：事实卡查重/查可能矛盾，只写报告（默认两小时一次）
                 try
@@ -452,7 +627,7 @@ public class MemoryInjectModule(
                         lastAudit = DateTime.Now;
                     }
                 }
-                catch (Exception e) { logger.LogWarning(e, "记忆回忆提示：审计失败（不影响主流程）"); }
+                catch (Exception e) { logger.LogWarning(e, "Retromem 溯忆：审计失败（不影响主流程）"); }
 
                 try { await Task.Delay(TimeSpan.FromMinutes(Math.Max(2, Configuration.AutoOrganizeMinutes)), DestroyCancellationToken); }
                 catch { break; }
@@ -525,7 +700,7 @@ public class MemoryInjectModule(
                 exclude = ExcludeSnapshot(), roots = memoryRoots.Select(x => x.root).ToArray(), result };
             File.WriteAllText(path, JsonSerializer.Serialize(manifest, new JsonSerializerOptions { WriteIndented = true }));
         }
-        catch (Exception e) { logger.LogWarning(e, "记忆书签：写入索引构建指纹失败"); }
+        catch (Exception e) { logger.LogWarning(e, "Retromem 溯忆：写入索引构建指纹失败"); }
     }
 
     /// <summary>供管理页调用：重建索引；失败时保留原库，成功后备份上一个版本。</summary>
@@ -581,6 +756,8 @@ public class MemoryInjectModule(
                     ["block_max"] = (Configuration?.BlockMaxChars ?? 200),
                     ["extra"] = BuildExtraRoots(),
                     ["exclude"] = ExcludeSnapshot(),
+                    ["layers"] = LayerSnapshot(),
+                    ["facts_only"] = true,   // 索引只认事实卡：重建也不能把官方流水再灌回来
                 }, 180000, tempIndex).ConfigureAwait(false);
             if (string.IsNullOrWhiteSpace(result)) return "重建失败或超时：旧索引保持不变。";
             if (!File.Exists(tempDb)) return "重建失败：新数据库未生成，旧索引保持不变。";
@@ -628,12 +805,13 @@ public class MemoryInjectModule(
             }
             await sidecar.AskAsync("stats", new Dictionary<string, object?>(), 5000, indexPath).ConfigureAwait(false);
             WriteManifest(result.Trim());
+            WriteScopeStamp();
             lastBuildCheck = DateTime.MinValue;
             return "安全重建完成：" + result.Trim() + "；原索引备份：" + (dbBackup.Length > 0 ? dbBackup : (indexBackup.Length > 0 ? indexBackup : "无旧库"));
         }
         catch (Exception e)
         {
-            logger.LogWarning(e, "记忆书签：安全索引重建失败");
+            logger.LogWarning(e, "Retromem 溯忆：安全索引重建失败");
             return "重建失败，旧索引已保留" + (dbBackup.Length > 0 ? "（备份：" + dbBackup + "）" : "") + "：" + e.Message;
         }
         finally
@@ -652,9 +830,9 @@ public class MemoryInjectModule(
                 try
                 {
                     var restart = await StartGraphServerOnlyAsync().ConfigureAwait(false);
-                    if (!restart.success) logger.LogWarning("记忆书签：索引重建后图谱服务未能自动重启：{Message}", restart.message);
+                    if (!restart.success) logger.LogWarning("Retromem 溯忆：索引重建后图谱服务未能自动重启：{Message}", restart.message);
                 }
-                catch (Exception e) { logger.LogWarning(e, "记忆书签：索引重建后图谱服务自动重启失败"); }
+                catch (Exception e) { logger.LogWarning(e, "Retromem 溯忆：索引重建后图谱服务自动重启失败"); }
             }
         }
     }
@@ -679,6 +857,8 @@ public class MemoryInjectModule(
 
     protected override async Task OnDestroy()
     {
+        sourceProgressTimer?.Dispose();
+        sourceProgressTimer = null;
         try { ChatBot.ChatSend -= OnChatSend; } catch { }
         await graphLifecycleLock.WaitAsync().ConfigureAwait(false);
         try
@@ -755,7 +935,7 @@ public class MemoryInjectModule(
         }
         catch (Exception e)
         {
-            logger.LogWarning(e, "记忆书签：等待图谱服务退出失败");
+            logger.LogWarning(e, "Retromem 溯忆：等待图谱服务退出失败");
             try { stopped = p.HasExited; } catch { stopped = false; }
         }
         if (stopped)
@@ -782,6 +962,13 @@ public class MemoryInjectModule(
                 if (!File.Exists(dbPath)) return "图谱索引不存在，请先构建索引。";
             }
             string expected = GraphIndexHash(indexPath);
+            await SourceStatusAsync().ConfigureAwait(false);
+            sourceProgressTimer ??= new Timer(async _ =>
+            {
+                if (Interlocked.Exchange(ref sourceProgressRefreshing, 1) != 0) return;
+                try { await SourceStatusAsync().ConfigureAwait(false); }
+                finally { Interlocked.Exchange(ref sourceProgressRefreshing, 0); }
+            }, null, 30000, 30000);
             if (graphServer != null && !graphServer.HasExited && graphIndexArg != indexPath)
             {
                 if (!await StopGraphServerAsync().ConfigureAwait(false))
@@ -1067,15 +1254,15 @@ public class MemoryInjectModule(
                     }
                     catch (Exception e)
                     {
-                        logger.LogWarning(e, "记忆书签：事实卡迁移跳过 {File}", f);
+                        logger.LogWarning(e, "Retromem 溯忆：事实卡迁移跳过 {File}", f);
                     }
                 }
             }
             Directory.CreateDirectory(factsRoot);
             File.WriteAllText(marker, DateTime.Now.ToString("o") + "\nfiles=" + files + " removed=" + removed);
-            logger.LogInformation("记忆书签：事实卡迁移完成，清理 {f} 个文件 / {n} 行垃圾", files, removed);
+            logger.LogInformation("Retromem 溯忆：事实卡迁移完成，清理 {f} 个文件 / {n} 行垃圾", files, removed);
         }
-        catch (Exception e) { logger.LogWarning(e, "记忆书签：事实卡迁移失败（下次启动重试）"); }
+        catch (Exception e) { logger.LogWarning(e, "Retromem 溯忆：事实卡迁移失败（下次启动重试）"); }
     }
 
     static bool IsSyntheticHistory(ChatMessageContent m)
@@ -1113,7 +1300,7 @@ public class MemoryInjectModule(
             if (hasMemory == false && (DateTime.Now - lastMemCheck).TotalSeconds >= 60)
             {
                 lastMemCheck = DateTime.Now;
-                try { hasMemory = memoryRoots.Any(x => HasMemoryFiles(x.root)); } catch { }
+                try { hasMemory = memoryRoots.Any(x => HasMemoryFiles(x.root)) || HasMemoryFiles(factsRoot); } catch { }
             }
             if (hasMemory == false) return message;
 
@@ -1124,10 +1311,14 @@ public class MemoryInjectModule(
             if (bare.Length < Configuration.MinQueryChars) return message;
 
             // 双水位线：先攒水，不到高水位或还在最小间隔内，就不查
+            // ★问句不等水位：一句「我前天血压多少」只有 7 个字，按 60 字水位永远攒不到，
+            //   等于单句提问从不触发自动召回（实测）。问句直接进检索，仍受最小间隔约束。
+            bool questionLike = Regex.IsMatch(stripped, "[?？]")
+                || Regex.IsMatch(stripped, "(吗|呢|多少|几个|几天|几点|哪|谁|什么|怎么|为什么|是否|有没有|记不记得)");
             waterLevel += bare.Length;
             int high = Math.Max(1, Configuration.WaterHighChars);
             double gap = Math.Max(0, Configuration.TriggerCooldownSeconds);
-            if (waterLevel < high) return message;
+            if (waterLevel < high && questionLike == false) return message;
             if ((DateTime.Now - lastTrigger).TotalSeconds < gap) return message;
             // 到点：回落水位、记下本次触发（无论查没查到，都算数，避免每句重试）
             waterLevel = Math.Max(0, Configuration.WaterLowChars);
@@ -1137,8 +1328,9 @@ public class MemoryInjectModule(
             // （有上限等待，超时/异常一律放过，退回下面的原提示）
             int waitMs = Math.Max(Configuration.SyncWaitMs, 200);
             if (warmDone == false) waitMs = Math.Max(waitMs, 5000);   // 预热未完成：给大库冷读留出时间，别当没命中
-            // ★SkipRecentDays 只作用于"自动书签"（按条目日期跳过最近 N 天）；手动工具传 0，永不跳过
-            RecallResult? recallResult = sidecar.RecallDetailedSync(stripped, waitMs, indexPath, Configuration.HalfLifeDays, Configuration.UseGraph, Configuration.SkipRecentDays, Configuration.MaxResults, Configuration.UseSemantic, Configuration.SemanticMinScore, recallGate: Configuration.RecallGateEnable, recallFilter: Configuration.RecallFilterEnable);
+            // ★SkipRecentDays 只作用于"自动记忆提示"（按条目日期跳过最近 N 天）；手动工具传 0，永不跳过
+            if (Configuration.UseReranker) waitMs = Math.Max(waitMs, Math.Clamp(Configuration.RerankWaitMs, 20, 5000));
+            RecallResult? recallResult = sidecar.RecallDetailedSync(stripped, waitMs, indexPath, Configuration.HalfLifeDays, Configuration.UseGraph, Configuration.SkipRecentDays, Configuration.MaxResults, Configuration.UseSemantic, Configuration.SemanticMinScore, recallGate: Configuration.RecallGateEnable, recallFilter: Configuration.RecallFilterEnable, useReranker: Configuration.UseReranker, rerankModelPath: Configuration.RerankModelPath, rerankMinScore: Configuration.RerankMinScore, vectorMinScore: Configuration.VectorMinScore);
             string? bookmarks = recallResult?.Bookmarks;
             if (string.IsNullOrWhiteSpace(bookmarks) == false)
             {
@@ -1148,60 +1340,21 @@ public class MemoryInjectModule(
                     ? "\n[要用全文：调 <memfetch source=\"出处文件名\"/> 或 <memwhen time=\"上周三\"/>，不要扫盘、不要凭印象编。]"
                     : "\n[要用全文：调 <memfetch source=\"出处文件名\"/>，别凭印象编。]";
                 string block =
-                    "[记忆书签·临时·仅本轮参考（按人/事/物查 index.json）]\n" + bookmarks + tail;
+                    "[Retromem 溯忆·临时记忆参考（按人/事/物检索有效事实卡）]\n" + bookmarks + tail;
                 if (recallResult != null && recallResult.Facts.ValueKind == JsonValueKind.Array
                     && RecordCallsSyncWithGap(Guid.NewGuid().ToString("N"), "automatic", recallResult.Facts, recallResult.WindowGen) == false)
                     logger.LogWarning("记忆调用统计写入失败；本轮书签仍正常附加");
                 return message + "\n" + block;
             }
 
-            // ★策略已判定不召回（门控/重复压制）：不得回落到按官方记忆文件检索的旧提示路径
-            if (recallResult != null && recallResult.PolicyBlocked) return message;
+            // No verified facts means no automatic hint. Legacy file-vector fallback
+            // must not bypass subject/time/evidence filters, including on backend failure.
+            return message;
 
-            EnsureChunks();
-            if (chunks.Count == 0) return message;
-
-            List<Chunk> hits = [];
-
-            // 语义：有上限等待（默认 150ms），超时/冷却期立刻退回关键词
-            if (Configuration.UseSemantic && vectorsReady && sidecar.IsReady && sidecar.Busy == false
-                && DateTime.Now >= cooldownUntil)
-            {
-                float[]? q = sidecar.EmbedSync(stripped, Configuration.SyncWaitMs);
-                if (q != null)
-                {
-                    timeoutStreak = 0;
-                    hits = QueryByVector(q);
-                }
-                else
-                {
-                    // 没拿到向量：不计数为超时（可能只是 Busy），只在连续失败时冷静
-                    if (Interlocked.Increment(ref timeoutStreak) >= Math.Max(1, Configuration.TimeoutStreakLimit))
-                    {
-                        cooldownUntil = DateTime.Now.AddSeconds(Math.Max(5, Configuration.CooldownSeconds));
-                        timeoutStreak = 0;
-                        logger.LogWarning("记忆回忆提示：语义连续超时，冷静 {S} 秒", Configuration.CooldownSeconds);
-                    }
-                }
-            }
-
-            if (hits.Count == 0) hits = QueryKeyword(stripped);
-            if (hits.Count == 0) return message;
-
-            var files = hits.Select(h => Path.GetFileNameWithoutExtension(h.Source))
-                            .Distinct().Take(Configuration.MaxResults);
-            string list = string.Join("、", files);
-
-            string hint = (Configuration.HintTemplate ?? "")
-                .Replace("{n}", hits.Count.ToString())
-                .Replace("{files}", list)
-                .Replace("{path}", memoryRoot);
-
-            return message + "\n" + hint;
         }
         catch (Exception e)
         {
-            logger.LogWarning(e, "记忆回忆提示失败，已放过原消息");
+            logger.LogWarning(e, "Retromem 溯忆失败，已放过原消息");
             return message;
         }
     }
@@ -1211,9 +1364,9 @@ public class MemoryInjectModule(
     //   （旧版四个工具全是 Task + Poke —— 调了等于白调，这是"工具调用"最要命的 bug。）
     // ★参数不要共用字段：并发调用会串参，一律用局部字典。
 
-    /// <summary>按人/事/物查书签。</summary>
+    /// <summary>按人/事/物检索事实卡。</summary>
     [XmlFunction(FunctionMode.OneShot, "memrecall")]
-    [Description("按人/事/物查记忆书签。想确认往事、查来龙去脉时第一个用它。")]
+    [Description("通过 Retromem 溯忆按人/事/物检索事实卡。想确认往事、查来龙去脉时第一个用它。")]
     public async Task<string> Recall(
         [Description("要查的内容，比如某人、某件事、某个物件")] string query)
     {
@@ -1227,6 +1380,10 @@ public class MemoryInjectModule(
             ["half_life"] = Configuration.HalfLifeDays,
             ["use_graph"] = Configuration.UseGraph,
             ["use_semantic"] = Configuration.UseSemantic,
+                ["use_reranker"] = Configuration.UseReranker,
+                ["rerank_model_path"] = Configuration.RerankModelPath,
+                ["rerank_min_score"] = Configuration.RerankMinScore,
+                ["vector_min_score"] = Configuration.VectorMinScore,
             ["semantic_min_score"] = Configuration.SemanticMinScore,
         }, 8000, indexPath).ConfigureAwait(false);
         string? bm = (r != null && r.Value.TryGetProperty("bookmarks", out JsonElement bEl)) ? (bEl.GetString() ?? "") : null;
@@ -1312,7 +1469,7 @@ public class MemoryInjectModule(
         }
         catch (Exception e)
         {
-            logger.LogWarning(e, "记忆书签：印象生成失败 person={Name}", name);
+            logger.LogWarning(e, "Retromem 溯忆：印象生成失败 person={Name}", name);
             return R($"生成 {name} 的印象失败：{e.Message}");
         }
         if (generated.Length == 0) return R($"生成 {name} 的印象失败：模型未返回内容（未写入缓存）。");
@@ -1353,6 +1510,10 @@ public class MemoryInjectModule(
                 ["top_k"] = k,
                 ["use_graph"] = Configuration.UseGraph,
                 ["use_semantic"] = Configuration.UseSemantic,
+                ["use_reranker"] = Configuration.UseReranker,
+                ["rerank_model_path"] = Configuration.RerankModelPath,
+                ["rerank_min_score"] = Configuration.RerankMinScore,
+                ["vector_min_score"] = Configuration.VectorMinScore,
             };
             JsonElement? result = await sidecar.AskJsonAsync("bywhen", args, 8000, indexPath).ConfigureAwait(false);
             string? bm = result != null && result.Value.TryGetProperty("bookmarks", out JsonElement bmElement)
@@ -1378,11 +1539,26 @@ public class MemoryInjectModule(
                 ["query"] = query ?? "", ["top_k"] = top, ["skip_recent_days"] = 0,
                 ["use_graph"] = Configuration.UseGraph,
                 ["use_semantic"] = Configuration.UseSemantic,
+                ["use_reranker"] = Configuration.UseReranker,
+                ["rerank_model_path"] = Configuration.RerankModelPath,
+                ["rerank_min_score"] = Configuration.RerankMinScore,
+                ["vector_min_score"] = Configuration.VectorMinScore,
                 ["semantic_min_score"] = Configuration.SemanticMinScore
             }, 8000, indexPath).ConfigureAwait(false);
             return R(string.IsNullOrWhiteSpace(text) ? "调试查询无结果（侧车可能未就绪）。" : text!);
         }
         catch (Exception e) { return "召回调试失败：" + e.Message; }
+    }
+
+    /// <summary>读取 JSON 里的整数字段（数字或字符串都认），取不到按 0。</summary>
+    private static int JsonInt(JsonElement element, string name)
+    {
+        if (element.TryGetProperty(name, out JsonElement value))
+        {
+            if (value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out int number)) return number;
+            if (value.ValueKind == JsonValueKind.String && int.TryParse(value.GetString(), out int parsed)) return parsed;
+        }
+        return 0;
     }
 
     /// <summary>索引体量/覆盖范围及诊断信息。</summary>
@@ -1392,7 +1568,45 @@ public class MemoryInjectModule(
     {
         try
         {
-            string? txt = await sidecar.AskAsync("stats", new Dictionary<string, object?>(), 5000, indexPath).ConfigureAwait(false);
+            JsonElement? stats = await sidecar.AskJsonAsync("stats", new Dictionary<string, object?>(), 5000, indexPath).ConfigureAwait(false);
+            string? txt = null;
+            string upkeep = "";
+            string semantic = "";
+            if (stats != null && stats.Value.ValueKind == JsonValueKind.Object)
+            {
+                if (stats.Value.TryGetProperty("text", out JsonElement textEl) && textEl.ValueKind == JsonValueKind.String)
+                    txt = textEl.GetString();
+                if (stats.Value.TryGetProperty("maintenance", out JsonElement upkeepEl)
+                    && upkeepEl.ValueKind == JsonValueKind.Object)
+                {
+                    if (upkeepEl.TryGetProperty("last", out JsonElement lastEl) && lastEl.ValueKind == JsonValueKind.Object)
+                    {
+                        string when = lastEl.TryGetProperty("created_at", out JsonElement createdEl)
+                            ? (createdEl.GetString() ?? "") : "";
+                        bool ok = lastEl.TryGetProperty("ok", out JsonElement okEl) && okEl.ValueKind == JsonValueKind.True;
+                        bool softOn = lastEl.TryGetProperty("allow_soft", out JsonElement softEl) && softEl.ValueKind == JsonValueKind.True;
+                        upkeep = "｜上次维护 " + (when.Length >= 19 ? when.Substring(0, 19) : when) + (ok ? " 成功" : " 失败") +
+                                 "（扫描 " + JsonInt(lastEl, "scanned") + "，软删 " + JsonInt(lastEl, "soft_deleted") +
+                                 "，物理清 " + JsonInt(lastEl, "purged") + "，软删" + (softOn ? "开启" : "关闭") + "）";
+                    }
+                    else upkeep = "｜还没有维护记录";
+                }
+                if (stats.Value.TryGetProperty("semantic", out JsonElement semEl) && semEl.ValueKind == JsonValueKind.Object)
+                {
+                    bool ready = semEl.TryGetProperty("ready", out JsonElement readyEl) && readyEl.ValueKind == JsonValueKind.True;
+                    bool warmed = semEl.TryGetProperty("warmed", out JsonElement warmEl) && warmEl.ValueKind == JsonValueKind.True;
+                    bool running = semEl.TryGetProperty("running", out JsonElement runEl) && runEl.ValueKind == JsonValueKind.True;
+                    semantic = "｜语义 " + (ready ? (warmed ? "就绪" : "已加载未预热") : "未加载") +
+                               (running ? "·预热中 " + JsonInt(semEl, "done") + "/" + JsonInt(semEl, "total") : "") +
+                               "·待算 " + JsonInt(semEl, "total") + " 条·已缓存 " + JsonInt(semEl, "cached") + " 条";
+                    if (semEl.TryGetProperty("reranker", out JsonElement rankEl))
+                    {
+                        semantic += rankEl.TryGetProperty("ready", out JsonElement rankReady) && rankReady.ValueKind == JsonValueKind.True ? "·精排就绪" : "·精排未就绪（关键词降级）";
+                        if (rankEl.TryGetProperty("error", out JsonElement rankError) && !string.IsNullOrWhiteSpace(rankError.GetString()))
+                            semantic += "·" + rankError.GetString();
+                    }
+                }
+            }
             string dbPath = Path.Combine(factsRoot, "memory.db");
             string store = File.Exists(dbPath) ? dbPath : indexPath;
             string storeInfo = File.Exists(store)
@@ -1426,7 +1640,8 @@ public class MemoryInjectModule(
                 "｜根目录 " + memoryRoot + "｜来源文件 " + fileCount + "（L1 " + l1Count + "，其他 " + otherCount + "）" +
                 "｜来源分布 " + string.Join(", ", sourceSummary.Select(x => x.Key + ":" + x.Value)) +
                 "｜排除 " + rule + "｜L1 " + (excludesL1 ? "已排除" : "未排除") +
-                "｜最新源文件 " + newest + "｜" + freshness + "｜" + storeInfo + "｜侧车 " + sidecar.Status);
+                "｜最新源文件 " + newest + "｜" + freshness + "｜" + storeInfo + upkeep + semantic + "｜侧车 " + sidecar.Status +
+                "\n" + await SourceStatusAsync().ConfigureAwait(false));
         }
         catch (Exception e) { return "看索引状态失败：" + e.Message; }
     }
@@ -1494,13 +1709,16 @@ public class MemoryInjectModule(
         try
         {
             if (organizing) return R("正在整理中（自动或上一次手动还没跑完），稍后再试。");
+            // 侧车加载 BGE 通常要几十秒；这期间提案一定失败，先说明白，别白烧一次模型调用
+            if (sidecar.IsReady == false)
+                return R("侧车还在加载模型（通常 1 分钟内），这次没有开始整理，也没消耗模型调用；稍后再调一次。");
             int cap = Math.Clamp(max_files <= 0 ? 5 : max_files, 1, 20);
             int chars = Math.Clamp(Configuration.LlmOrganizeManualMaxChars, 2000, Configuration.LlmOrganizeMaxChars);
             var (n, fact) = await LlmOrganizeAsync(cap, force: true, maxChars: chars).ConfigureAwait(false);
-            if (n == 0) return R("没有需要整理的流水（都已整理过，或模型/侧车没就绪）。");
+            if (n == 0) return R(string.IsNullOrWhiteSpace(fact) ? "本轮未完成整理；水位未推进，请查看日志。" : fact);
             string tail = string.IsNullOrWhiteSpace(fact)
                 ? "模型认为这批没长期价值，已推进水位。"
-                : "已提交事实待审提案 -> " + Path.GetFileName(fact) + "（需在管理页人工确认后写入）";
+                : fact;
             return R($"已整理 {n} 份流水：{tail}（批次刻意小，避免占满上下文；需要继续就再调一次）");
         }
         catch (Exception e) { return "整理失败：" + e.Message; }
@@ -1508,12 +1726,12 @@ public class MemoryInjectModule(
 
     /// <summary>① 手动触发一次压缩。</summary>
     [XmlFunction(FunctionMode.OneShot, "memcompact")]
-    [Description("把条目多且够旧的记忆流水整理为事实卡待审提案；人工确认全部提案后才把来源记为已压缩，官方文件原样不动。")]
+    [Description("整理较旧流水：新事实自动入库，完全重复跳过，近似或冲突留审；全部处理完成后标记来源，官方文件原样不动。")]
     public async Task<string> Compact()
     {
         int n = await AutoCompactAsync(force: true).ConfigureAwait(false);
         string msg = n > 0
-            ? ("已提交 " + n + " 份流水的事实待审提案；人工确认后才会标记来源已压缩（官方文件未动）。")
+            ? ("已处理 " + n + " 份流水：新事实自动入库，重复跳过，近似或冲突留审；全部处理完成后标记来源（官方文件未动）。")
             : "没有需要压缩的流水（条目数/天数门槛未到，或侧车没就绪）。";
         return R(msg);
     }
@@ -1667,12 +1885,27 @@ public class MemoryInjectModule(
     {
         EnsureExcludes();
         string[] exSnapshot = ExcludeSnapshot();
+        string[] layers = LayerSnapshot();
+        // 层级白名单只约束官方来源：插件自有 MemoryFacts 里没有 L1/L5 这种目录
+        bool official = true;
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(factsRoot))
+            {
+                official = !string.Equals(
+                    Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar),
+                    Path.GetFullPath(factsRoot).TrimEnd(Path.DirectorySeparatorChar),
+                    StringComparison.OrdinalIgnoreCase);
+            }
+        }
+        catch (Exception) { }
         if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root)) yield break;
         foreach (string f in EnumerateFilesSafe(root))
         {
             string rel = f.Substring(root.Length).Replace('\\', '/').TrimStart('/');
             if (rel.Contains(".bak", StringComparison.OrdinalIgnoreCase)) continue;
             if (IsExcludedRel(rel, exSnapshot)) continue;
+            if (official && !InLayerRange(rel, layers)) continue;
             yield return f;
         }
     }
@@ -1699,7 +1932,8 @@ public class MemoryInjectModule(
     {
         if (sidecar.IsReady == false) return;
         if (string.IsNullOrWhiteSpace(indexPath)) return;
-        if (Directory.Exists(memoryRoot) == false) return;
+        // 索引只认事实卡：官方目录不在也要能建（角色只剩卡时不能失联）
+        if (Directory.Exists(memoryRoot) == false && Directory.Exists(factsRoot) == false) return;
 
         // 节流：非强制时，两分钟内只查一次
         if (force == false && (DateTime.Now - lastBuildCheck).TotalSeconds < 120) return;
@@ -1719,24 +1953,37 @@ public class MemoryInjectModule(
                 {
                     try { DateTime t = File.GetLastWriteTime(item.file); if (t > newest) newest = t; } catch { }
                 }
+                // 事实卡也要算"比库新"：卡片追加后不重建，新记忆不会进索引
+                if (Directory.Exists(factsRoot))
+                {
+                    foreach (string factFile in EnumerateMemoryFiles(factsRoot))
+                    {
+                        try { DateTime t = File.GetLastWriteTime(factFile); if (t > newest) newest = t; } catch { }
+                    }
+                }
                 need = newest > idxTime;   // 有比索引还新的记忆 → 重建
             }
             string manifestPath = Path.Combine(factsRoot, "index_manifest.json");
             if (need == false && !File.Exists(manifestPath)) need = true;
+            // 来源范围（层级白名单/排除清单）变了也要重建一次：升级到 5.1 的旧库
+            // 还按旧范围（只读 L2–L6）在用，不重建等于配置没生效。
+            if (need == false && ScopeChanged()) need = true;
             if (need == false) return;
 
             EnsureExcludes();
             var r = await sidecar.BuildAsync(memoryRoot, indexPath, blockMax: Configuration.BlockMaxChars,
-                extra: BuildExtraRoots(), exclude: ExcludeSnapshot()).ConfigureAwait(false);
+                extra: BuildExtraRoots(), exclude: ExcludeSnapshot(), layers: LayerSnapshot(),
+                factsOnly: true).ConfigureAwait(false);
             if (r != null)
             {
                 WriteManifest("auto: " + r.Value.count + " entries");
+                WriteScopeStamp();
             }
-            else logger.LogWarning("记忆书签：索引重建未成功（不影响主流程）");
+            else logger.LogWarning("Retromem 溯忆：索引重建未成功（不影响主流程）");
         }
         catch (Exception e)
         {
-            logger.LogWarning(e, "记忆书签：索引重建异常（已忽略）");
+            logger.LogWarning(e, "Retromem 溯忆：索引重建异常（已忽略）");
         }
     }
 
@@ -1747,10 +1994,10 @@ public class MemoryInjectModule(
     /// </summary>
     async Task<(int files, string fact)> LlmOrganizeAsync(int maxFiles = 0, bool force = false, int maxChars = 0)
     {
-        if (organizing) return (0, "");
+        if (!await organizeLock.WaitAsync(0).ConfigureAwait(false)) return (0, "正在整理中，请稍后再试。");
         organizing = true;
         try { return await LlmOrganizeCoreAsync(maxFiles, force, maxChars).ConfigureAwait(false); }
-        finally { organizing = false; }
+        finally { organizing = false; organizeLock.Release(); }
     }
 
     async Task<(int files, string fact)> LlmOrganizeCoreAsync(int maxFiles, bool force, int maxChars = 0)
@@ -1759,8 +2006,10 @@ public class MemoryInjectModule(
         if (force == false && Configuration.LlmOrganizeEnable == false) return (0, "");
         // ★自动整理绝不在模型回合进行中插 ChatAsync：ChatAsync 会写 ChatHistory，
         //   与 UI 渲染并发时会抛 "Collection was modified"。手动工具(force)不受此限。
-        if (force == false && functionCaller.IsIdle == false) return (0, "");
-        if (string.IsNullOrWhiteSpace(memoryRoot) || Directory.Exists(memoryRoot) == false) return (0, "");
+        if (force == false && functionCaller.IsIdle == false) return (0, "模型正在处理对话，本轮暂缓自动整理。");
+        if (string.IsNullOrWhiteSpace(memoryRoot) || Directory.Exists(memoryRoot) == false) return (0, "整理来源目录不可用，未开始模型调用。");
+        // 侧车未就绪时提案一定失败：别先把 20 秒的模型调用烧掉（自动路径同理）
+        if (sidecar.IsReady == false) return (0, "侧车尚未就绪，未开始模型调用；下一轮检查重试。");
 
         // 读水位：已整理过的 文件相对路径|mtime 集合
         var done = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1812,13 +2061,14 @@ public class MemoryInjectModule(
                         if (s2.Length > 0) pendingCompact.Add(s2);
                     }
             }
-            catch (Exception e) { logger.LogWarning(e, "记忆书签：查询待压缩清单失败（本轮不跳过）"); }
+            catch (Exception e) { logger.LogWarning(e, "Retromem 溯忆：查询待压缩清单失败（本轮不跳过）"); }
         }
 
         // 找出没整理过的记忆文件（跳过事实卡本身、索引、状态文件）
         // ★关键顺序：先收集全部候选 → 按修改时间从新到旧排序 → 再按预算选材。
         //   旧实现边枚举边扣预算、最后才排序，枚举顺序（目录/文件名）会让老档先吃光预算，新档永远轮不到。
-        var fresh = new List<(string path, string key, string text, DateTime mt)>();
+        var readProgress = LoadOrganizeProgress();
+        var fresh = new List<(string path, string source, string key, string text, int end, string prefixHash, DateTime mt)>();
         int budget = Math.Max(2000, maxChars > 0 ? maxChars : Configuration.LlmOrganizeMaxChars);
         try
         {
@@ -1826,35 +2076,19 @@ public class MemoryInjectModule(
             foreach (var item in EnumerateAllMemoryFiles())
             {
                 string f = item.file;
-                string name = Path.GetFileName(f);
-                if (name.StartsWith("事实_") || name.StartsWith("审计报告_")
-                    || name == "index.json" || name == "llm_organize_state.txt"
-                    || name == "compacted_sources.txt" || name.EndsWith("记忆索引视图.html")) continue;
+                if (!IsOrganizeSourceFile(f)) continue;
                 string relPath = item.source;
                 if (compactHealthy && pendingCompact.Contains(relPath)) continue;   // 留给压缩
                 DateTime mt;
                 try { mt = File.GetLastWriteTime(f); } catch { continue; }
                 string txt;
                 try { txt = File.ReadAllText(f); } catch { continue; }
-                // ★水位 = relPath|内容哈希|已整理到第几个字符。
-                //   内容变了哈希就变，自然从头来；内容没变只推进 offset，绝不重复喂同一段。
-                //   这样既能"每批只喂很小一段"（省上下文），也不会像截断那样丢掉文件尾巴。
+                // 原水位保留兼容；新增前缀校验允许追加后的文件从已读位置续读。
+                // 前缀改写才重新整理，失败不推进，未读完的尾部由下一批继续。
                 string baseKey = relPath + "|" + ContentKey(txt);
-                if (done.Contains(baseKey)) continue;                 // 旧格式：整份已处理
-                int offset = 0;
-                foreach (string k in done)
-                {
-                    if (k.StartsWith(baseKey + "|", StringComparison.OrdinalIgnoreCase) == false) continue;
-                    if (int.TryParse(k.Substring(baseKey.Length + 1), out int off2) && off2 > offset) offset = off2;
-                }
-                if (legacyDone.Contains(relPath))
-                {
-                    // 旧水位：只有文件在水位写盘之后没再改过，才算"已处理"；
-                    // 改过就按新内容整理，避免升级后漏掉最后一次改动。
-                    if (mt <= stateTime.AddSeconds(5)) { done.Add(baseKey + "|" + txt.Length); continue; }
-                }
+                int offset = OrganizedOffset(relPath, txt, mt, done, legacyDone, stateTime, readProgress);
                 if (string.IsNullOrWhiteSpace(txt)) { done.Add(baseKey + "|" + txt.Length); continue; }
-                if (offset >= txt.Length) continue;
+                if (offset >= txt.Length) { done.Add(baseKey + "|" + txt.Length); continue; }
                 cands.Add((f, baseKey, relPath, mt, txt, offset));
             }
             // 新→旧：新流水优先
@@ -1869,41 +2103,39 @@ public class MemoryInjectModule(
                 if (done.Contains(key)) continue;
                 int fileCap = maxFiles > 0 ? Math.Clamp(maxFiles, 1, 200) : Math.Max(1, Configuration.LlmOrganizeMaxFilesPerRun);
                 if (fresh.Count >= fileCap) break;
-                fresh.Add((c.path, key, seg, c.mt));
+                fresh.Add((c.path, c.rel, key, seg, c.offset + take,
+                           ContentKey(c.text.Substring(0, c.offset + take)), c.mt));
                 budget -= take;
             }
         }
-        catch (Exception e) { logger.LogWarning(e, "记忆书签：模型整理扫描失败"); return (0, ""); }
+        catch (Exception e) { logger.LogWarning(e, "Retromem 溯忆：模型整理扫描失败"); return (0, "读取整理来源失败，未开始模型调用；请查看日志。"); }
 
-        if (fresh.Count == 0) return (0, "");
+        if (fresh.Count == 0) return (0, "没有新增或改动的待整理流水，本轮未调用模型。");
 
         string body = string.Join("\n\n", fresh.Select(x => "【" + Path.GetFileName(x.path) + "】\n" + x.text));
         string prompt =
             "[消息来源(记忆整理)]下面是刚落盘的新记忆流水。请把它提炼成若干条「事实卡」，每条一行，格式：\n" +
             "- 日期 | 涉及谁 | 属哪件事 | 一句话事实\n" +
             "要求：只记事实，别抒情、别复述细节；只提炼有长期价值的信息（决定、进度、健康状况、约定、重要结论）；" +
-            "没价值的不记。只输出事实行：不要调用任何工具（Python/Expression/Speak 等），不要输出代码、XML 或解释，不要寒暄。\n\n" + body;
+            "确无长期价值时仅输出 [NO_FACTS]。否则只输出事实行：不要调用任何工具（Python/Expression/Speak 等），不要输出代码、XML 或解释，不要寒暄。\n\n" + body;
 
         // ★隔离调用：不写角色 ChatHistory（旧写法会把 1 万字提示词永久留在上下文里）
-        string cards = await AskModelIsolatedAsync(prompt).ConfigureAwait(false);
-        if (string.IsNullOrWhiteSpace(cards))
+        string cards = await AskModelIsolatedAsync(prompt, throwOnFailure: true).ConfigureAwait(false);
+        if (cards.Trim() == "[NO_FACTS]")
         {
-            // 模型认为没价值：仍记水位，免得反复重试同一个文件
-            foreach (var x in fresh) done.Add(x.key);
-            TrySaveState(done);
+            // Only an explicit successful no-facts response advances this watermark.
+            SaveOrganizeCompletion(done, fresh.Select(x => (x.source, x.key, x.end, x.prefixHash)));
             return (fresh.Count, "");
         }
 
         // ★只留事实行：模型回包常夹带 XML/代码（真央那份事实卡就被写进了 <Python>…）
         string cleanCards = SanitizeFactCards(cards, out int droppedCards);
         if (droppedCards > 0)
-            logger.LogWarning("记忆书签：整理回包丢弃 {n} 行非事实内容", droppedCards);
+            logger.LogWarning("Retromem 溯忆：整理回包丢弃 {n} 行非事实内容", droppedCards);
         if (string.IsNullOrWhiteSpace(cleanCards))
         {
-            // 全是垃圾：不算失败，推进水位，别让同一批反复重喂
-            foreach (var x in fresh) done.Add(x.key);
-            TrySaveState(done);
-            return (fresh.Count, "");
+            logger.LogWarning("Retromem 溯忆：整理回包没有合法事实行，保留本批输入等待重试");
+            return (0, "模型有回包，但没有合法事实行；水位未推进，请查看日志后重试。");
         }
         // ③ 写入合并：不再直接 AppendAllText —— 先与已有事实合并（重复丢弃、相近合并）
         var inputRanges = new List<object?>();
@@ -1919,16 +2151,183 @@ public class MemoryInjectModule(
         string factFile = await AppendFactsAsync(cleanCards, inputRanges).ConfigureAwait(false);
         if (string.IsNullOrWhiteSpace(factFile))
         {
-            logger.LogWarning("记忆书签：模型整理写盘失败（水位不推进，稍后重试）");
-            return (0, "");
+            logger.LogWarning("Retromem 溯忆：事实提案入队失败（水位不推进，稍后重试）");
+            return (0, "模型回包已收到，但事实提案未成功入队；水位未推进，请查看日志。");
         }
 
-        foreach (var x in fresh) done.Add(x.key);
-        TrySaveState(done);
+        SaveOrganizeCompletion(done, fresh.Select(x => (x.source, x.key, x.end, x.prefixHash)));
         return (fresh.Count, factFile);
     }
 
-    /// <summary>内容指纹（文件内容变了才变），水位用它，避免 mtime 抖动导致反复重喂。</summary>
+    /// <summary>各来源的已读取前缀与可证明的成功读取时间。</summary>
+    sealed class OrganizeReadProgress
+    {
+        public int Offset { get; set; }
+        public string PrefixHash { get; set; } = "";
+        public DateTime ReadAtUtc { get; set; }
+    }
+
+    string OrganizeProgressPath => Path.Combine(factsRoot, "organize_read_progress.json");
+
+    Dictionary<string, OrganizeReadProgress> LoadOrganizeProgress()
+    {
+        if (!File.Exists(OrganizeProgressPath)) return new(StringComparer.OrdinalIgnoreCase);
+        var records = JsonSerializer.Deserialize<Dictionary<string, OrganizeReadProgress>>(File.ReadAllText(OrganizeProgressPath));
+        return new(records ?? throw new InvalidDataException("整理进度文件不可读"), StringComparer.OrdinalIgnoreCase);
+    }
+
+    static bool IsOrganizeSourceFile(string file)
+    {
+        string name = Path.GetFileName(file);
+        return !(name.StartsWith("事实_") || name.StartsWith("审计报告_")
+            || name == "index.json" || name == "llm_organize_state.txt"
+            || name == "compacted_sources.txt" || name.EndsWith("记忆索引视图.html"));
+    }
+
+    static int OrganizedOffset(string source, string text, DateTime modified,
+        HashSet<string> done, HashSet<string> legacy, DateTime stateTime,
+        Dictionary<string, OrganizeReadProgress> progress)
+    {
+        string baseKey = source + "|" + ContentKey(text);
+        int offset = 0;
+        if (done.Contains(baseKey)) return text.Length;
+        if (legacy.Contains(source) && modified <= stateTime.AddSeconds(5)) return text.Length;
+        if (progress.TryGetValue(source, out var saved) && saved != null
+            && saved.Offset > 0 && saved.Offset <= text.Length
+            && ContentKey(text.Substring(0, saved.Offset)) == saved.PrefixHash)
+            offset = saved.Offset;
+        foreach (string key in done)
+        {
+            if (!key.StartsWith(source + "|", StringComparison.OrdinalIgnoreCase)) continue;
+            string[] parts = key.Substring(source.Length + 1).Split('|');
+            if (parts.Length != 2 || !int.TryParse(parts[1], out int end)
+                || end <= offset || end > text.Length) continue;
+            // 同版本延续原水位；升级前已读完的文件，可用旧全量哈希验证现有前缀。
+            if (key.StartsWith(baseKey + "|", StringComparison.OrdinalIgnoreCase)
+                || ContentKey(text.Substring(0, end)) == parts[0]) offset = end;
+        }
+        return offset;
+    }
+
+    void SaveOrganizeCompletion(HashSet<string> done,
+        IEnumerable<(string source, string key, int end, string prefixHash)> reads)
+    {
+        var progress = LoadOrganizeProgress();
+        DateTime now = DateTime.UtcNow;
+        foreach (var read in reads)
+        {
+            done.Add(read.key);
+            progress[read.source] = new() { Offset = read.end, PrefixHash = read.prefixHash, ReadAtUtc = now };
+        }
+        // 只在模型明确无事实、或事实已成功自动入库/留审后推进；失败重试不提前跳过。
+        Directory.CreateDirectory(factsRoot);
+        string path = OrganizeProgressPath, temp = path + ".tmp-" + Guid.NewGuid().ToString("N");
+        try { File.WriteAllText(temp, JsonSerializer.Serialize(progress)); File.Move(temp, path, true); }
+        finally { if (File.Exists(temp)) File.Delete(temp); }
+        TrySaveState(done);
+        lock (sourceProgressLock) sourceProgressCheckedAt = DateTime.MinValue;
+    }
+
+    sealed class OrganizeLayerProgress
+    {
+        public int Total, Pending, Partial, Unreadable, Processed;
+        public DateTime LastReadUtc;
+    }
+
+    static string SourceLayer(string source)
+        => source.Replace('\\', '/').Split('/').FirstOrDefault(IsLayerSegment)?.ToUpperInvariant() ?? "未分层";
+
+    public Task<string> SourceStatusAsync() => Task.Run(() =>
+    {
+        try
+        {
+            lock (sourceProgressLock)
+            {
+                string scope = ScopeSignature();
+                if (scope != sourceProgressScope || (DateTime.UtcNow - sourceProgressCheckedAt).TotalSeconds >= 30)
+                {
+                    var done = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    var legacy = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    DateTime stateTime = File.Exists(llmStatePath) ? File.GetLastWriteTime(llmStatePath) : DateTime.MinValue;
+                    if (File.Exists(llmStatePath)) foreach (string raw in File.ReadAllLines(llmStatePath))
+                    {
+                        string one = raw.Trim(); int bar = one.IndexOf('|');
+                        if (bar > 0 && one.Substring(bar + 1).Length > 0 && one.Substring(bar + 1).All(char.IsDigit))
+                            legacy.Add(one.Substring(0, bar));
+                        else if (one.Length > 0) done.Add(one);
+                    }
+                    var reads = LoadOrganizeProgress();
+                    string[] layers = LayerSnapshot();
+                    var rows = new Dictionary<string, OrganizeLayerProgress>(StringComparer.OrdinalIgnoreCase);
+                    var pendingFiles = new List<object>();
+                    foreach (string layer in new[] { "L1", "L100" }.Concat(layers)) rows.TryAdd(layer.ToUpperInvariant(), new());
+                    foreach (var item in EnumerateAllMemoryFiles())
+                    {
+                        if (!IsOrganizeSourceFile(item.file)) continue;
+                        string layer = SourceLayer(item.source);
+                        if (!rows.TryGetValue(layer, out var row)) rows[layer] = row = new();
+                        row.Total++;
+                        try
+                        {
+                            string text = File.ReadAllText(item.file);
+                            int offset = OrganizedOffset(item.source, text, File.GetLastWriteTime(item.file), done, legacy, stateTime, reads);
+                            if (!string.IsNullOrWhiteSpace(text) && offset < text.Length)
+                            {
+                                row.Pending++;
+                                pendingFiles.Add(new { source = item.source, layer,
+                                    status = offset > 0 ? "partial" : "pending", offset, total_chars = text.Length });
+                            }
+                            if (offset > 0) { row.Processed++; if (offset < text.Length) row.Partial++; }
+                        }
+                        catch (IOException) { row.Unreadable++; pendingFiles.Add(new { source = item.source, layer, status = "unreadable", offset = 0, total_chars = 0 }); }
+                        catch (UnauthorizedAccessException) { row.Unreadable++; pendingFiles.Add(new { source = item.source, layer, status = "unreadable", offset = 0, total_chars = 0 }); }
+                    }
+                    foreach (var read in reads)
+                        if (read.Value != null && rows.TryGetValue(SourceLayer(read.Key), out var row)
+                            && read.Value.ReadAtUtc > row.LastReadUtc) row.LastReadUtc = read.Value.ReadAtUtc;
+                    var lines = new List<string>();
+                    var layerData = new List<object>();
+                    foreach (var pair in rows)
+                    {
+                        bool enabled = pair.Key == "未分层" || layers.Length == 0 || layers.Contains(pair.Key, StringComparer.OrdinalIgnoreCase);
+                        var row = pair.Value;
+                        layerData.Add(new { layer = pair.Key, enabled, total = row.Total,
+                            pending = row.Pending, partial = row.Partial, unreadable = row.Unreadable,
+                            last_read_at = row.LastReadUtc == DateTime.MinValue ? (DateTime?)null : row.LastReadUtc,
+                            legacy_time_unknown = row.LastReadUtc == DateTime.MinValue && row.Processed > 0 });
+                        string last = row.LastReadUtc == DateTime.MinValue
+                            ? (row.Processed > 0 ? "未知（旧版未记录时间）" : "暂无成功读取记录")
+                            : row.LastReadUtc.ToLocalTime().ToString("MM-dd HH:mm:ss");
+                        lines.Add(pair.Key + (enabled
+                            ? " 已启用｜待整理 " + row.Pending + " / " + row.Total + " 份" + (row.Partial > 0 ? "（含部分完成 " + row.Partial + "）" : "")
+                            : " 已停用｜待整理 —") + "｜最近成功读取 " + last +
+                            (row.Unreadable > 0 ? "｜读取失败 " + row.Unreadable + " 份" : ""));
+                    }
+                    sourceProgressCache = string.Join("\n", lines);
+                    sourceProgressScope = scope;
+                    sourceProgressCheckedAt = DateTime.UtcNow;
+                    sourceProgressPayload = new() { ["updated_at"] = sourceProgressCheckedAt,
+                        ["layers"] = layerData, ["files"] = pendingFiles };
+                }
+                string run = organizing ? "正在整理" : !Configuration.Enable ? "插件已停用" : Configuration.LlmOrganizeEnable ? "自动整理已开启" : "自动整理已关闭，可手动整理";
+                if (Configuration.Enable && Configuration.LlmOrganizeEnable && !organizing)
+                {
+                    double startup = Configuration.LlmOrganizeStartupDelayMinutes - (DateTime.Now - startedAt).TotalMinutes;
+                    if (startup > 0) run += " · 启动等待约 " + Math.Ceiling(startup) + " 分钟";
+                }
+                sourceProgressPayload["state"] = run;
+                Directory.CreateDirectory(factsRoot);
+                string snapshot = Path.Combine(factsRoot, "organize_status.json");
+                string temp = snapshot + ".tmp-" + Guid.NewGuid().ToString("N");
+                try { File.WriteAllText(temp, JsonSerializer.Serialize(sourceProgressPayload)); File.Move(temp, snapshot, true); }
+                finally { if (File.Exists(temp)) File.Delete(temp); }
+                return run + "\n" + sourceProgressCache + "\n每 30 秒统计；待整理按文件计，含未读完的部分。成功读取含无事实或留审结果。";
+            }
+        }
+        catch (Exception e) { return "来源进度读取失败：" + e.Message; }
+    });
+
+    /// <summary>内容指纹；仅修改时间变化不会触发重复整理。</summary>
     static string ContentKey(string text)
     {
         try
@@ -1956,15 +2355,18 @@ public class MemoryInjectModule(
 
     void TrySaveState(HashSet<string> done)
     {
+        string temp = llmStatePath + ".tmp-" + Guid.NewGuid().ToString("N");
         try
         {
             // ★不要按字典序截断：旧实现只留 500 条且按路径排序，超过后会把"路径靠前"的文件
             //   水位丢掉 → 它们每轮都被当成新文件重新整理（反复重喂）。
             var all = done.ToList();
             if (all.Count > 20000) all = all.Take(20000).ToList();   // 只是防病态膨胀
-            File.WriteAllLines(llmStatePath, all);
+            File.WriteAllLines(temp, all);
+            File.Move(temp, llmStatePath, true);
         }
-        catch (Exception e) { logger.LogWarning(e, "记忆书签：模型整理水位写盘失败"); }
+        catch (Exception e) { logger.LogWarning(e, "Retromem 溯忆：模型整理水位写盘失败"); }
+        finally { if (File.Exists(temp)) File.Delete(temp); }
     }
 
     // ===== ① 自动压缩 / ② 审计 / ③ 写入合并 / ⑥ 内嵌浏览 =====
@@ -2053,7 +2455,7 @@ public class MemoryInjectModule(
                     lock (excludesLock) pending = pendingProposalSources.ToArray();
                     File.WriteAllLines(pendingProposalPath, pending);
                 }
-                catch (Exception e) { logger.LogDebug(e, "记忆书签：清理待审来源清单失败"); }
+                catch (Exception e) { logger.LogDebug(e, "Retromem 溯忆：清理待审来源清单失败"); }
                 return;
             }
             Directory.CreateDirectory(factsRoot);
@@ -2064,9 +2466,9 @@ public class MemoryInjectModule(
                 lock (excludesLock) pending = pendingProposalSources.ToArray();
                 File.WriteAllLines(pendingProposalPath, pending);
             }
-            catch (Exception e) { logger.LogDebug(e, "记忆书签：更新待审来源清单失败"); }
+            catch (Exception e) { logger.LogDebug(e, "Retromem 溯忆：更新待审来源清单失败"); }
         }
-        catch (Exception e) { logger.LogWarning(e, "记忆书签：记录压缩标记失败"); }
+        catch (Exception e) { logger.LogWarning(e, "Retromem 溯忆：记录压缩标记失败"); }
     }
 
     /// <summary>撤回提案审计时恢复来源候选；只改插件自己的标记文件，不改官方记忆文件。</summary>
@@ -2088,7 +2490,7 @@ public class MemoryInjectModule(
             File.WriteAllLines(compactStatePath, compacted);
             File.WriteAllLines(pendingProposalPath, pending);
         }
-        catch (Exception e) { logger.LogWarning(e, "记忆书签：撤回提案后恢复来源失败"); }
+        catch (Exception e) { logger.LogWarning(e, "Retromem 溯忆：撤回提案后恢复来源失败"); }
     }
 
     async Task RefreshAcceptedProposalSourcesAsync()
@@ -2099,8 +2501,14 @@ public class MemoryInjectModule(
         try
         {
             JsonElement? root = await sidecar.AskJsonAsync("proposalstatus",
-                new Dictionary<string, object?> { ["sources"] = pending }, 3000, indexPath).ConfigureAwait(false);
+                new Dictionary<string, object?> { ["sources"] = pending, ["factsdir"] = factsRoot },
+                3000, indexPath, preserveError: true).ConfigureAwait(false);
             if (root == null) return;
+            if (root.Value.TryGetProperty("error", out JsonElement statusError))
+            {
+                logger.LogWarning("Retromem 溯忆：提案状态查询被拒绝：{Reason}", statusError.GetString() ?? "");
+                return;
+            }
             if (root.Value.TryGetProperty("restored_sources", out JsonElement restored)
                 && restored.ValueKind == JsonValueKind.Array)
             {
@@ -2120,7 +2528,7 @@ public class MemoryInjectModule(
                 MarkCompacted(source);
             }
         }
-        catch (Exception e) { logger.LogDebug(e, "记忆书签：查询待审提案状态失败"); }
+        catch (Exception e) { logger.LogDebug(e, "Retromem 溯忆：查询待审提案状态失败"); }
     }
 
     /// <summary>工具结果回显：Poke 会挂进聊天框（人工可见）；模型同轮已拿到返回值，故可关。</summary>
@@ -2150,18 +2558,33 @@ public class MemoryInjectModule(
     /// 原来的 chatBot.ChatAsync 会把上万字的整理/压缩提示词永久塞进上下文，
     /// 把 128k 窗口顶爆，进而触发官方压缩、UI 渲染与改历史打架。
     /// </summary>
-    async Task<string> AskModelIsolatedAsync(string prompt)
+    async Task<string> AskModelIsolatedAsync(string prompt, bool throwOnFailure = false)
     {
         try
         {
             ChatHistoryAgentThread thread = new();
             thread.ChatHistory.AddUserMessage(prompt ?? "");
-            string? resp = await chatBot.LanguageModel.ChatStreamingAsync(thread).ConfigureAwait(false);
-            return (resp ?? "").Trim();
+            // ★ChatStreamingAsync 是流式接口：正文可能只从 onToken 回调出来，
+            //   返回值在部分模型/通道下是空串（实测印象生成、事实卡整理全被判成
+            //   "模型未返回内容"）。这里同时累积回调内容，再回退到返回值。
+            StringBuilder chunks = new();
+            string? resp = await chatBot.LanguageModel.ChatStreamingAsync(
+                thread,
+                chunk => { if (string.IsNullOrEmpty(chunk) == false) chunks.Append(chunk); },
+                null, null, null, CancellationToken.None).ConfigureAwait(false);
+            string text = (resp ?? "").Trim();
+            if (text.Length == 0) text = chunks.ToString().Trim();
+            if (text.Length == 0)
+                logger.LogWarning("Retromem 溯忆：隔离模型调用返回空（prompt {Chars} 字，流式累计 {Streamed} 字）",
+                    (prompt ?? "").Length, chunks.Length);
+            if (throwOnFailure && text.Length == 0)
+                throw new InvalidOperationException("记忆整理模型返回空响应，未推进水位。");
+            return text;
         }
         catch (Exception e)
         {
-            logger.LogWarning(e, "记忆书签：隔离模型调用失败");
+            logger.LogWarning(e, "Retromem 溯忆：隔离模型调用失败");
+            if (throwOnFailure) throw;
             return "";
         }
     }
@@ -2224,6 +2647,15 @@ public class MemoryInjectModule(
 
     async Task<string> AppendFactsAsync(string cards, IEnumerable<object?>? provenance = null, string? markSource = null)
     {
+        // ★侧车刚启动时还在加载 BGE：AskJsonAsync 会立刻返回 null（不是超时，
+        //   日志却写成"超时"，18:32 那次就是这么误报的）。提案前先等它就绪，最多 90 秒。
+        for (int i = 0; i < 900 && sidecar.IsReady == false; i++)
+            await Task.Delay(100).ConfigureAwait(false);
+        if (sidecar.IsReady == false)
+        {
+            logger.LogWarning("Retromem 溯忆：侧车尚未就绪，事实提案留到下一轮（水位不推进）");
+            return "";
+        }
         await factLock.WaitAsync().ConfigureAwait(false);
         try
         {
@@ -2232,30 +2664,58 @@ public class MemoryInjectModule(
             // ★先只留事实行：模型回包里的 XML/代码/解释一律丢掉
             string clean = SanitizeFactCards(cards, out int dropped);
             if (dropped > 0)
-                logger.LogWarning("记忆书签：事实卡丢弃 {n} 行非事实内容（XML/代码/自由文本）", dropped);
+                logger.LogWarning("Retromem 溯忆：事实卡丢弃 {n} 行非事实内容（XML/代码/自由文本）", dropped);
             if (string.IsNullOrWhiteSpace(clean)) return "";
             var lines = clean.Split('\n').Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
             if (lines.Count == 0) return "";
-            // 事实写入必须先进入统一审计待审队列；这里不得直接修改事实卡。
+            // 统一侧车处理：新事实自动写入，完全重复跳过，其余保留审计候选。
             // provenance 是模型输入范围，不能声称与每条事实逐条精确对应。
             var args = new Dictionary<string, object?>
             {
                 ["lines"] = lines,
+                ["factsdir"] = factsRoot,
+                ["auto_accept"] = true,
                 ["target"] = Path.GetFileName(factFile),
                 ["provenance"] = provenance?.ToArray() ?? Array.Empty<object?>(),
                 ["mark_source"] = markSource ?? "",
             };
-            JsonElement? proposal = await sidecar.AskJsonAsync("factproposal", args, 8000, indexPath).ConfigureAwait(false);
-            if (proposal == null) return "";
+            JsonElement? proposal = await sidecar.AskJsonAsync("factproposal", args, 20000, indexPath, preserveError: true).ConfigureAwait(false);
+            if (proposal == null)
+            {
+                // 侧车可能正忙于召回/向量预热，排队超过 20 秒：等一下重试一次
+                await Task.Delay(1500).ConfigureAwait(false);
+                proposal = await sidecar.AskJsonAsync("factproposal", args, 20000, indexPath, preserveError: true).ConfigureAwait(false);
+            }
+            if (proposal == null)
+            {
+                logger.LogWarning("Retromem 溯忆：事实提案入队超时（侧车无响应，水位不推进）");
+                return "";
+            }
+            if (proposal.Value.TryGetProperty("error", out JsonElement errorEl))
+            {
+                logger.LogWarning("Retromem 溯忆：事实提案被拒绝：{Reason}", errorEl.GetString() ?? "");
+                return "";
+            }
             if (proposal.Value.TryGetProperty("accepted", out JsonElement accepted)
                 && accepted.ValueKind == JsonValueKind.True && accepted.GetBoolean())
-                return "";
+            {
+                if (!string.IsNullOrWhiteSpace(markSource)) MarkCompacted(markSource);
+                return "该来源此前已处理，本次未重复写入。";
+            }
+            bool automaticResult = proposal.Value.TryGetProperty("processed_count", out JsonElement processed)
+                && processed.ValueKind == JsonValueKind.Number && processed.GetInt32() > 0;
+            int pendingCount = automaticResult ? JsonInt(proposal.Value, "pending_count") : 0;
             if (proposal.Value.TryGetProperty("proposal_ids", out JsonElement ids) == false
-                || ids.ValueKind != JsonValueKind.Array || ids.GetArrayLength() == 0)
+                || ids.ValueKind != JsonValueKind.Array || (!automaticResult && ids.GetArrayLength() == 0))
                 return "";
             if (!string.IsNullOrWhiteSpace(markSource))
             {
-                lock (excludesLock) pendingProposalSources.Add(markSource);
+                bool sourceAccepted = proposal.Value.TryGetProperty("source_accepted", out JsonElement completed)
+                    && completed.ValueKind == JsonValueKind.True;
+                if (automaticResult && pendingCount == 0 && sourceAccepted)
+                    MarkCompacted(markSource);
+                else if (!automaticResult || pendingCount > 0)
+                    lock (excludesLock) pendingProposalSources.Add(markSource);
                 try
                 {
                     Directory.CreateDirectory(factsRoot);
@@ -2263,13 +2723,17 @@ public class MemoryInjectModule(
                     lock (excludesLock) pending = pendingProposalSources.ToArray();
                     File.WriteAllLines(pendingProposalPath, pending);
                 }
-                catch (Exception e) { logger.LogDebug(e, "记忆书签：保存待审来源清单失败"); }
+                catch (Exception e) { logger.LogDebug(e, "Retromem 溯忆：保存待审来源清单失败"); }
             }
+            if (automaticResult)
+                return "自动入库 " + JsonInt(proposal.Value, "auto_written") + " 条，重复或已处理跳过 " +
+                       (JsonInt(proposal.Value, "auto_skipped") + JsonInt(proposal.Value, "already_processed")) +
+                       " 条，待审 " + pendingCount + " 条（仅近似、冲突等候选需人工确认）。";
             return "待审提案：" + ids.GetArrayLength();
         }
         catch (Exception e)
         {
-            logger.LogWarning(e, "记忆书签：事实卡写入失败");
+            logger.LogWarning(e, "Retromem 溯忆：事实提案提交异常（水位不推进）");
             return "";
         }
         finally { factLock.Release(); }
@@ -2326,7 +2790,7 @@ public class MemoryInjectModule(
                 if (string.IsNullOrWhiteSpace(cards)) { continue; }
                 string cleanCards = SanitizeFactCards(cards, out int droppedCards);
                 if (droppedCards > 0)
-                    logger.LogWarning("记忆书签：压缩回包丢弃 {n} 行非事实内容 {src}", droppedCards, source);
+                    logger.LogWarning("Retromem 溯忆：压缩回包丢弃 {n} 行非事实内容 {src}", droppedCards, source);
                 if (string.IsNullOrWhiteSpace(cleanCards)) { continue; }
 
                 var inputRanges = new List<object?>();
@@ -2343,18 +2807,18 @@ public class MemoryInjectModule(
                 // 提案尚未人工接受：此处绝不能标记来源已压缩。
                 // RefreshAcceptedProposalSourcesAsync 在后续轮次确认 accept 后再标记。
                 done++;
-                logger.LogInformation("记忆书签：已提交事实待审提案 {src} -> {f}（人工接受后才标记已压缩）", source, factFile);
+                logger.LogInformation("Retromem 溯忆：流水整理结果 {src} -> {f}", source, factFile);
             }
             // 没积压（清单空）或至少压成一份 → 认为压缩链路健康，organize 才敢把文件留给它
             if (anyCand == false || done > 0) lastCompactOk = DateTime.Now;
         }
-        catch (Exception e) { logger.LogWarning(e, "记忆书签：自动压缩失败"); }
+        catch (Exception e) { logger.LogWarning(e, "Retromem 溯忆：自动压缩失败"); }
         finally { compacting = false; }
         // 提案提交后刷新侧车索引；来源在人工接受前仍保留在官方索引中。
         if (done > 0)
         {
             try { await EnsureIndexAsync(force: true).ConfigureAwait(false); }
-            catch (Exception e) { logger.LogWarning(e, "记忆书签：压缩后重建索引失败"); }
+            catch (Exception e) { logger.LogWarning(e, "Retromem 溯忆：压缩后重建索引失败"); }
         }
         return done;
     }
@@ -2410,10 +2874,10 @@ public class MemoryInjectModule(
                 sb.Append("# 记忆审计报告 · ").Append(DateTime.Now.ToString("yyyy-MM-dd")).Append("\n\n");
             foreach (string r in fresh) sb.Append(r).Append('\n');
             File.AppendAllText(report, sb.ToString());
-            logger.LogInformation("记忆书签：审计新增 {n} 条 -> {f}", fresh.Count, report);
+            logger.LogInformation("Retromem 溯忆：审计新增 {n} 条 -> {f}", fresh.Count, report);
             return fresh.Count;
         }
-        catch (Exception e) { logger.LogWarning(e, "记忆书签：审计失败"); return 0; }
+        catch (Exception e) { logger.LogWarning(e, "Retromem 溯忆：审计失败"); return 0; }
         finally { auditing = false; }
     }
 
@@ -2481,7 +2945,7 @@ public class MemoryInjectModule(
         }
         catch (Exception e)
         {
-            logger.LogWarning(e, "记忆回忆提示：向量计算失败");
+            logger.LogWarning(e, "Retromem 溯忆：向量计算失败");
         }
         finally
         {

@@ -1,5 +1,7 @@
 """侧车共享可变状态、静态表与纯状态变更。所有对象只被就地修改，不做重绑定。"""
 
+import io
+import json
 import os
 import re
 import sys
@@ -69,6 +71,8 @@ def _set_index(path):
     if path and _IDX.get("path") != path:
         _GRAPH["built"] = False      # ★换索引=换图：不清就会拿上一个角色的图去扩词
         _IDX["path"] = path
+        # 已确认人物是每个角色自己的业务状态，跟随索引目录切换（R05 确认入口）
+        _load_confirmed(path)
         c = _CACHE.get(path)
         if c is not None:
             _IDX["data"] = c.get("data")
@@ -154,17 +158,24 @@ _NEG = ("没", "未", "不", "取消", "放弃", "作废")
 
 
 _ENTITY_PATTERNS = [
-    re.compile(r"《([^》]{1,20})》"),
-    re.compile(r"「([^」]{1,20})」"),
-    re.compile(r"『([^』]{1,20})』"),
-    re.compile(r"“([^”]{1,30})”"),
-    re.compile(r"‘([^’]{1,30})’"),
+    re.compile(r"《([^》\r\n]{1,20})》"),
+    re.compile(r"「([^」\r\n]{1,20})」"),
+    re.compile(r"『([^』\r\n]{1,20})』"),
+    # ★引号内不允许跨行：否则一个孤立的左引号会吞下整段 markdown，
+    #   实测该缺陷在真央库造出 6000+ 个含标点的垃圾节点。
+    re.compile(r"“([^”\r\n]{1,30})”"),
+    re.compile(r"‘([^’\r\n]{1,30})’"),
     re.compile(r'"([^"\r\n]{1,30})"'),
     re.compile(r"([\u4e00-\u9fff]{2,6}(?:插件|项目|模型|客户端|服务|工具|游戏|软件))"),
 ]
 
 
 _ENTITY_STOP = set(["什么", "这个", "那个", "我们", "他们", "自己", "现在", "今天", "昨天", "明天"])
+
+
+# 人物标签里不该出现的：无上下文代词（事实卡 who 字段被写成"他"是历史数据）
+_PERSON_STOP = set(["我", "你", "他", "她", "它", "您", "我们", "你们", "他们", "她们", "它们",
+                    "自己", "大家", "咱", "咱们", "本人", "对方", "彼此", "某人", "有人"])
 
 
 _DB = {"ok": False, "path": "", "conn": None}
@@ -179,13 +190,16 @@ CREATE TABLE IF NOT EXISTS entries(
   time TEXT, date TEXT, period TEXT, hour INTEGER,
   head TEXT, summary TEXT, body TEXT, hay TEXT, text_hash TEXT,
   people TEXT, topics TEXT, things TEXT,
+  people_shared TEXT, people_pending TEXT,
   access_count INTEGER DEFAULT 0, last_access TEXT,
   retired INTEGER DEFAULT 0, retired_at TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_entries_time ON entries(time);
 CREATE INDEX IF NOT EXISTS ix_entries_source ON entries(source);
 CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, mtime REAL);
-CREATE TABLE IF NOT EXISTS vec(id TEXT PRIMARY KEY, data BLOB);
+CREATE TABLE IF NOT EXISTS vec(
+  id TEXT PRIMARY KEY, version TEXT, model TEXT, dim INTEGER, data BLOB
+);
 CREATE TABLE IF NOT EXISTS nodes(name TEXT PRIMARY KEY, n INTEGER);
 CREATE TABLE IF NOT EXISTS edges(a TEXT, b TEXT, w INTEGER, type TEXT, PRIMARY KEY(a, b));
 CREATE TABLE IF NOT EXISTS call_events(
@@ -197,6 +211,16 @@ CREATE TABLE IF NOT EXISTS call_events(
   PRIMARY KEY(logical_id, fact_id)
 );
 CREATE INDEX IF NOT EXISTS ix_call_events_fact_time ON call_events(fact_id, called_at);
+CREATE TABLE IF NOT EXISTS maintenance_runs(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT NOT NULL,
+  ok INTEGER NOT NULL,
+  scanned INTEGER DEFAULT 0,
+  soft_deleted INTEGER DEFAULT 0,
+  purged INTEGER DEFAULT 0,
+  allow_soft INTEGER DEFAULT 0,
+  error TEXT
+);
 CREATE TABLE IF NOT EXISTS call_stats_meta(
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -225,6 +249,63 @@ _PROFILE_KIND_COLUMNS = {
 }
 
 
+# 用户手动确认过的人物标签（people_confirm.json）。分类不再只凭"含中文"猜人物，
+# 判不准的进 people_pending；这个集合就是"确认入口"的持久结果（5.1.1 复核 R05）。
+# rejected 是从待分类队列里移除、但原文仍保留的标签（5.1.2 复核 S06）：不删正文，
+# 只是在待分类列表里不再询问。
+_CONFIRMED = {"names": set(), "rejected": set(), "path": ""}
+
+
+def _confirmed_path(index_path):
+    return os.path.join(os.path.dirname(os.path.abspath(index_path)), "people_confirm.json")
+
+
+def _load_confirmed(index_path):
+    """按当前索引目录载入已确认/已排除人物；文件缺失=空集合，损坏只告警。"""
+    _CONFIRMED["names"].clear()
+    _CONFIRMED["rejected"].clear()
+    _CONFIRMED["path"] = _confirmed_path(index_path) if index_path else ""
+    if not index_path or not os.path.isfile(_CONFIRMED["path"]):
+        return _CONFIRMED["names"]
+    try:
+        with io.open(_CONFIRMED["path"], encoding="utf-8") as fh:
+            data = json.load(fh)
+        names = data.get("confirmed") if isinstance(data, dict) else None
+        rejected = data.get("rejected", []) if isinstance(data, dict) else []
+        if not isinstance(names, list) or not isinstance(rejected, list):
+            raise ValueError("confirmed/rejected must be lists")
+        _CONFIRMED["names"].update(
+            str(name).strip() for name in names if str(name or "").strip())
+        _CONFIRMED["rejected"].update(
+            str(name).strip() for name in rejected if str(name or "").strip())
+    except (OSError, ValueError) as exc:
+        _warn("read confirmed people: %s" % _CONFIRMED["path"], exc)
+    return _CONFIRMED["names"]
+
+
+def _save_confirmed(names, rejected=None):
+    """原子写入已确认/已排除人物清单；返回文件路径。"""
+    path = _CONFIRMED["path"]
+    if not path:
+        raise ValueError("index path is required before confirming people")
+    clean = sorted({str(name).strip() for name in names if str(name or "").strip()})
+    if rejected is None:
+        rejected = _CONFIRMED.get("rejected") or set()
+    clean_rejected = sorted({str(name).strip() for name in rejected if str(name or "").strip()})
+    clean = [name for name in clean if name not in clean_rejected]
+    tmp = path + ".tmp"
+    with io.open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump({"version": 1, "confirmed": clean, "rejected": clean_rejected},
+                  fh, ensure_ascii=False, indent=1)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    _CONFIRMED["names"] = set(clean)
+    _CONFIRMED["rejected"] = set(clean_rejected)
+    return path
+
+
 _WARNED = set()
 
 
@@ -239,6 +320,6 @@ def _warn(context, error):
     if key in _WARNED:
         return
     _WARNED.add(key)
-    sys.stderr.write("[memoryinject] %s failed: %s: %s\n"
+    sys.stderr.write("[Retromem 溯忆] %s failed: %s: %s\n"
                      % (context, type(error).__name__, error))
     sys.stderr.flush()

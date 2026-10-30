@@ -246,11 +246,11 @@ public sealed class EmbedSidecar : IAsyncDisposable
     public string? RecallSync(string query, int waitMs, string? indexPath = null, double? halfLife = null, bool? useGraph = null, int skipRecentDays = 0, int topK = 5, bool useSemantic = false, double semanticMinScore = 0.58)
         => RecallDetailedSync(query, waitMs, indexPath, halfLife, useGraph, skipRecentDays, topK, useSemantic, semanticMinScore)?.Bookmarks;
 
-    public RecallResult? RecallDetailedSync(string query, int waitMs, string? indexPath = null, double? halfLife = null, bool? useGraph = null, int skipRecentDays = 0, int topK = 5, bool useSemantic = false, double semanticMinScore = 0.58, bool recallGate = false, bool recallFilter = false)
+    public RecallResult? RecallDetailedSync(string query, int waitMs, string? indexPath = null, double? halfLife = null, bool? useGraph = null, int skipRecentDays = 0, int topK = 5, bool useSemantic = false, double semanticMinScore = 0.58, bool recallGate = false, bool recallFilter = false, bool useReranker = false, string rerankModelPath = "", double rerankMinScore = 0.1, double vectorMinScore = 0.4)
     {
         if (IsReady == false || Busy || process == null || process.HasExited) return null;
         int budget = Math.Max(waitMs, 20);
-        Task<RecallResult?> t = Task.Run(() => RecallDetailedAsync(query, budget * 4, indexPath, halfLife, useGraph, skipRecentDays, topK, useSemantic, semanticMinScore, "automatic", recallGate, recallFilter));
+        Task<RecallResult?> t = Task.Run(() => RecallDetailedAsync(query, budget * 4, indexPath, halfLife, useGraph, skipRecentDays, topK, useSemantic, semanticMinScore, "automatic", recallGate, recallFilter, useReranker, rerankModelPath, rerankMinScore, vectorMinScore));
         try
         {
             if (t.Wait(budget) == false) return null;
@@ -263,10 +263,10 @@ public sealed class EmbedSidecar : IAsyncDisposable
     }
 
     /// <summary>异步召回：发 recall 请求给侧车、拿书签文本；失败返回 null。</summary>
-    public async Task<string?> RecallAsync(string query, int timeoutMs = 800, string? indexPath = null, double? halfLife = null, bool? useGraph = null, int skipRecentDays = 0, int topK = 5, bool useSemantic = false, double semanticMinScore = 0.58, string entry = "automatic", bool recallGate = false, bool recallFilter = false)
-        => (await RecallDetailedAsync(query, timeoutMs, indexPath, halfLife, useGraph, skipRecentDays, topK, useSemantic, semanticMinScore, entry, recallGate, recallFilter).ConfigureAwait(false))?.Bookmarks;
+    public async Task<string?> RecallAsync(string query, int timeoutMs = 800, string? indexPath = null, double? halfLife = null, bool? useGraph = null, int skipRecentDays = 0, int topK = 5, bool useSemantic = false, double semanticMinScore = 0.58, string entry = "automatic", bool recallGate = false, bool recallFilter = false, bool useReranker = false, string rerankModelPath = "", double rerankMinScore = 0.1, double vectorMinScore = 0.4)
+        => (await RecallDetailedAsync(query, timeoutMs, indexPath, halfLife, useGraph, skipRecentDays, topK, useSemantic, semanticMinScore, entry, recallGate, recallFilter, useReranker, rerankModelPath, rerankMinScore, vectorMinScore).ConfigureAwait(false))?.Bookmarks;
 
-    public async Task<RecallResult?> RecallDetailedAsync(string query, int timeoutMs = 800, string? indexPath = null, double? halfLife = null, bool? useGraph = null, int skipRecentDays = 0, int topK = 5, bool useSemantic = false, double semanticMinScore = 0.58, string entry = "automatic", bool recallGate = false, bool recallFilter = false)
+    public async Task<RecallResult?> RecallDetailedAsync(string query, int timeoutMs = 800, string? indexPath = null, double? halfLife = null, bool? useGraph = null, int skipRecentDays = 0, int topK = 5, bool useSemantic = false, double semanticMinScore = 0.58, string entry = "automatic", bool recallGate = false, bool recallFilter = false, bool useReranker = false, string rerankModelPath = "", double rerankMinScore = 0.1, double vectorMinScore = 0.4)
     {
         if (IsReady == false || process == null || process.HasExited) return null;
         int id = Interlocked.Increment(ref nextId);
@@ -275,7 +275,7 @@ public sealed class EmbedSidecar : IAsyncDisposable
 
         try
         {
-            string payload = JsonSerializer.Serialize(new { id, fn = "recall", query, top_k = Math.Clamp(topK, 1, 20), index = indexPath ?? "", half_life = halfLife, use_graph = useGraph, skip_recent_days = skipRecentDays, use_semantic = useSemantic, semantic_min_score = semanticMinScore, entry, recall_gate = recallGate, recall_filter = recallFilter });
+            string payload = JsonSerializer.Serialize(new { id, fn = "recall", query, top_k = Math.Clamp(topK, 1, 20), index = indexPath ?? "", half_life = halfLife, use_graph = useGraph, skip_recent_days = skipRecentDays, use_semantic = useSemantic, semantic_min_score = semanticMinScore, entry, recall_gate = recallGate, recall_filter = recallFilter, use_reranker = useReranker, rerank_model_path = rerankModelPath, rerank_min_score = rerankMinScore, vector_min_score = vectorMinScore });
             await writeLock.WaitAsync().ConfigureAwait(false);
             try
             {
@@ -434,10 +434,11 @@ public sealed class EmbedSidecar : IAsyncDisposable
     /// 重建慢，调用方一律放后台；超时/失败返回 null，绝不外抛。
     /// </summary>
     public async Task<(int count, string outPath)?> BuildAsync(string memdir, string? outPath = null, int timeoutMs = 60000, int? blockMax = null,
-        IEnumerable<string>? extra = null, IEnumerable<string>? exclude = null)
+        IEnumerable<string>? extra = null, IEnumerable<string>? exclude = null,
+        IEnumerable<string>? layers = null, bool factsOnly = false)
     {
         if (IsReady == false || process == null || process.HasExited) return null;
-        if (string.IsNullOrWhiteSpace(memdir)) return null;
+        if (string.IsNullOrWhiteSpace(memdir) && factsOnly == false) return null;
 
         int id = Interlocked.Increment(ref nextId);
         TaskCompletionSource<JsonElement> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -447,9 +448,11 @@ public sealed class EmbedSidecar : IAsyncDisposable
         {
             string payload = JsonSerializer.Serialize(new
             {
-                id, fn = "build", memdir, @out = outPath ?? "", block_max = blockMax,
+                id, fn = "build", memdir = memdir ?? "", @out = outPath ?? "", block_max = blockMax,
                 extra = extra?.ToArray() ?? Array.Empty<string>(),
                 exclude = exclude?.ToArray() ?? Array.Empty<string>(),
+                layers = layers?.ToArray() ?? Array.Empty<string>(),
+                facts_only = factsOnly,
             });
             await writeLock.WaitAsync().ConfigureAwait(false);
             try
@@ -509,7 +512,7 @@ public sealed class EmbedSidecar : IAsyncDisposable
     /// 异步取整个回包（compactscan / auditscan / browse 这类结构化结果要用整包）。
     /// 超时或 ok=false 返回 null。
     /// </summary>
-    public async Task<JsonElement?> AskJsonAsync(string fn, Dictionary<string, object?> args, int timeoutMs = 5000, string? indexPath = null)
+    public async Task<JsonElement?> AskJsonAsync(string fn, Dictionary<string, object?> args, int timeoutMs = 5000, string? indexPath = null, bool preserveError = false)
     {
         if (IsReady == false || process == null || process.HasExited) return null;
 
@@ -538,6 +541,9 @@ public sealed class EmbedSidecar : IAsyncDisposable
             }
 
             JsonElement root = await tcs.Task.ConfigureAwait(false);
+            // Opt in to distinguish a received business rejection from a timeout.
+            // Existing callers keep their original null-on-error contract.
+            if (preserveError && root.TryGetProperty("error", out _)) return root.Clone();
             if (root.TryGetProperty("ok", out JsonElement okEl) == false || okEl.GetBoolean() == false)
                 return null;
             return root.Clone();

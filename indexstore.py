@@ -93,10 +93,11 @@ def tokenize(query):
             if not covered(base):
                 terms.append(run)
             continue
-        # 短串整体成词：提高精度（"帕尔曼"整体命中 > 拆成"帕尔"+"尔曼"）
-        if len(run) <= 8 and not covered(base):
+        # 短串整体成词：提高精度（"帕尔曼"整体命中 > 拆成"帕尔"+"尔曼"）。
+        # ★只对 4 字以内的实体名这么做；5 字以上基本是句子（"我前天体温多少"），
+        #   整句成一个词就再也切不出"体温"，召回直接空转，所以整句不占位、照常滑窗。
+        if len(run) <= 4 and not covered(base):
             terms.append(run)
-            # 整串已占位：下面的 2 字滑窗要跳过这段，否则还会吐碎片噪声
             used.append((base, base + len(run)))
         for i in range(len(run) - 1):
             pos = base + i
