@@ -1,3 +1,10 @@
+# 语义检索依赖（可选）：装上才有向量精排；不装也能跑，自动退回词频召回
 numpy>=1.26
 onnxruntime>=1.18
 tokenizers>=0.19
+transformers>=4.30
+
+# torch 必须装 CPU 版：默认 PyPI 上的 torch 会带整套 CUDA 运行时，
+# 光 import 就多占 1.3G 私有内存，每个角色的侧车进程都吃一份。
+# 这里不写裸 torch 行，免得 pip install -r 直接拉成 CUDA 版。请单独执行：
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
