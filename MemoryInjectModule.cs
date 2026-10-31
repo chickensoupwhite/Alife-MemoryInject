@@ -62,7 +62,9 @@ public class MemoryInjectModule(
     string indexPath = "";
     System.Diagnostics.Process? graphServer;
     string graphIndexArg = "";
-    const int GraphPort = 18763;
+    const int GraphPortBase = 18763;   // 首选端口；被别的角色/服务占用时自动往后找
+    const int GraphPortTries = 40;
+    int graphPort = GraphPortBase;
     DateTime lastBuildCheck = DateTime.MinValue;
     readonly SemaphoreSlim rebuildLock = new(1, 1);
     readonly SemaphoreSlim graphLifecycleLock = new(1, 1);
@@ -143,7 +145,7 @@ public class MemoryInjectModule(
     }
 
     public string SidecarStatus => sidecar.Status;
-    public string GraphPageUrl => $"http://127.0.0.1:{GraphPort}/";
+    public string GraphPageUrl => $"http://127.0.0.1:{graphPort}/";
 
     sealed class Chunk
     {
@@ -885,7 +887,7 @@ public class MemoryInjectModule(
         try
         {
             using var http = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromMilliseconds(800) };
-            using var resp = await http.GetAsync("http://127.0.0.1:" + GraphPort + "/health").ConfigureAwait(false);
+            using var resp = await http.GetAsync("http://127.0.0.1:" + graphPort + "/health").ConfigureAwait(false);
             if (!resp.IsSuccessStatusCode) return (false, false);
             using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync().ConfigureAwait(false));
             JsonElement root = doc.RootElement;
@@ -902,7 +904,7 @@ public class MemoryInjectModule(
         try
         {
             using var http = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromMilliseconds(800) };
-            using var resp = await http.GetAsync("http://127.0.0.1:" + GraphPort + "/").ConfigureAwait(false);
+            using var resp = await http.GetAsync("http://127.0.0.1:" + graphPort + "/").ConfigureAwait(false);
             return resp.IsSuccessStatusCode && resp.Content.Headers.ContentType?.MediaType == "text/html";
         }
         catch { return false; }
@@ -947,6 +949,77 @@ public class MemoryInjectModule(
         return stopped;
     }
 
+    /// <summary>端口是否还能在本机回环上绑定（我们自己的服务已占用时这里会返回 false）。</summary>
+    static bool PortLooksFree(int port)
+    {
+        try
+        {
+            var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, port);
+            listener.Start();
+            listener.Stop();
+            return true;
+        }
+        catch (Exception) { return false; }
+    }
+
+    /// <summary>
+    /// 在指定端口上把图谱服务拉起来：先看它是不是"本索引"的服务（是就直接复用），
+    /// 被别的角色/服务占了就返回 foreign，让调用方换下一个端口。
+    /// </summary>
+    async Task<(bool ok, bool foreign, string error)> TryStartGraphOnPortAsync(
+        int port, string serverScript, string indexPath, string expected, string logPath)
+    {
+        graphPort = port;
+        graphIndexArg = indexPath;
+        var (healthy, foreign) = await ProbeGraphHealthAsync(expected).ConfigureAwait(false);
+        if (healthy) return (true, false, "");
+        if (foreign) return (false, true, "端口 " + port + " 已被其他服务占用");
+        if (PortLooksFree(port) == false) return (false, true, "端口 " + port + " 已被占用");
+
+        if (!healthy && (graphServer == null || graphServer.HasExited))
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = string.IsNullOrWhiteSpace(Configuration?.PythonExe) ? "python" : Configuration.PythonExe,
+                Arguments = "\"" + serverScript + "\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WorkingDirectory = Path.GetDirectoryName(serverScript) ?? "",
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                RedirectStandardInput = true
+            };
+            psi.Environment["ALIFE_MEMORY_GRAPH_PORT"] = port.ToString();
+            psi.Environment["ALIFE_MEMORY_GRAPH_INDEX"] = indexPath;
+            psi.Environment["ALIFE_MEMORY_GRAPH_PARENT_STDIN"] = "1";
+            psi.Environment["ALIFE_MEMORY_GRAPH_NO_MODEL"] = "1";
+            psi.Environment["PYTHONIOENCODING"] = "utf-8";
+            var p = System.Diagnostics.Process.Start(psi);
+            if (p == null) return (false, false, "无法启动关系图谱服务");
+            graphServer = p;
+            DataReceivedEventHandler logLine = (_, ev) =>
+            {
+                if (string.IsNullOrEmpty(ev.Data)) return;
+                try { File.AppendAllText(logPath, DateTime.Now.ToString("HH:mm:ss ") + ev.Data + Environment.NewLine); } catch { }
+            };
+            p.ErrorDataReceived += logLine;
+            p.OutputDataReceived += logLine;
+            p.BeginErrorReadLine();
+            p.BeginOutputReadLine();
+        }
+
+        bool ready = healthy && await ProbeGraphPageAsync().ConfigureAwait(false);
+        for (int i = 0; i < 40 && !ready; i++)
+        {
+            await Task.Delay(150).ConfigureAwait(false);
+            if (graphServer != null && graphServer.HasExited) break;
+            var probe = await ProbeGraphHealthAsync(expected).ConfigureAwait(false);
+            if (probe.foreign) return (false, true, "端口 " + port + " 已被其他服务占用");
+            ready = probe.ok && await ProbeGraphPageAsync().ConfigureAwait(false);
+        }
+        return ready ? (true, false, "") : (false, false, "端口 " + port + " 启动失败或超时");
+    }
+
     public async Task<string> OpenGraphPageAsync()
     {
         await graphLifecycleLock.WaitAsync().ConfigureAwait(false);
@@ -974,58 +1047,20 @@ public class MemoryInjectModule(
                 if (!await StopGraphServerAsync().ConfigureAwait(false))
                     return "旧的关系图谱服务尚未退出，请稍后重试。";
             }
-            graphIndexArg = indexPath;
-
-            var (healthy, foreign) = await ProbeGraphHealthAsync(expected).ConfigureAwait(false);
-            if (foreign)
-                return $"本机端口 {GraphPort} 已被另一个服务占用，请关闭旧的图谱服务或 Alife 后重试。";
 
             string logPath = Path.Combine(factsRoot, "graphserver.log");
-            if (!healthy && (graphServer == null || graphServer.HasExited))
+            string lastError = "未知原因";
+            bool started = false;
+            for (int attempt = 0; attempt < GraphPortTries; attempt++)
             {
-                var psi = new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = string.IsNullOrWhiteSpace(Configuration?.PythonExe) ? "python" : Configuration.PythonExe,
-                    Arguments = "\"" + serverScript + "\"",
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    WorkingDirectory = Path.GetDirectoryName(serverScript) ?? "",
-                    RedirectStandardError = true,
-                    RedirectStandardOutput = true,
-                    RedirectStandardInput = true
-                };
-                psi.Environment["ALIFE_MEMORY_GRAPH_PORT"] = GraphPort.ToString();
-                psi.Environment["ALIFE_MEMORY_GRAPH_INDEX"] = indexPath;
-                psi.Environment["ALIFE_MEMORY_GRAPH_PARENT_STDIN"] = "1";
-                psi.Environment["ALIFE_MEMORY_GRAPH_NO_MODEL"] = "1";
-                psi.Environment["PYTHONIOENCODING"] = "utf-8";
-                var p = System.Diagnostics.Process.Start(psi);
-                if (p == null) return "无法启动关系图谱服务。";
-                graphServer = p;
-                DataReceivedEventHandler logLine = (_, ev) =>
-                {
-                    if (string.IsNullOrEmpty(ev.Data)) return;
-                    try { File.AppendAllText(logPath, DateTime.Now.ToString("HH:mm:ss ") + ev.Data + Environment.NewLine); } catch { }
-                };
-                p.ErrorDataReceived += logLine;
-                p.OutputDataReceived += logLine;
-                p.BeginErrorReadLine();
-                p.BeginOutputReadLine();
+                int candidate = GraphPortBase + attempt;
+                var (ok, _foreign, error) = await TryStartGraphOnPortAsync(candidate, serverScript, indexPath, expected, logPath).ConfigureAwait(false);
+                if (ok) { started = true; break; }
+                lastError = error;
+                if (graphServer != null) await StopGraphServerAsync().ConfigureAwait(false);
             }
-
-            bool pageReady = healthy && await ProbeGraphPageAsync().ConfigureAwait(false);
-            bool ready = healthy && pageReady;
-            for (int i = 0; i < 40 && !ready; i++)
-            {
-                await Task.Delay(150).ConfigureAwait(false);
-                if (graphServer != null && graphServer.HasExited) break;
-                var probe = await ProbeGraphHealthAsync(expected).ConfigureAwait(false);
-                if (probe.foreign)
-                    return $"本机端口 {GraphPort} 已被另一个服务占用，请关闭旧的图谱服务或 Alife 后重试。";
-                ready = probe.ok && await ProbeGraphPageAsync().ConfigureAwait(false);
-            }
-            if (!ready)
-                return $"关系图谱服务启动失败（端口 {GraphPort}）。查看日志：{logPath}";
+            if (!started)
+                return $"关系图谱服务启动失败：{lastError}（已尝试 {GraphPortTries} 个端口 {GraphPortBase}–{GraphPortBase + GraphPortTries - 1}）。日志：{logPath}";
 
             string url = GraphPageUrl;
             System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true });
@@ -1063,60 +1098,21 @@ public class MemoryInjectModule(
                 if (!await StopGraphServerAsync().ConfigureAwait(false))
                     return (false, "旧的关系图谱服务尚未退出，请稍后重试。", "");
             }
-            graphIndexArg = indexPath;
-
-            var (healthy, foreign) = await ProbeGraphHealthAsync(expected).ConfigureAwait(false);
-            if (foreign)
-                return (false, $"端口 {GraphPort} 已被占用，请关闭旧服务后重试。", "");
-
             string logPath = Path.Combine(factsRoot, "graphserver.log");
-            if (!healthy && (graphServer == null || graphServer.HasExited))
+            string lastError = "未知原因";
+            bool started = false;
+            for (int attempt = 0; attempt < GraphPortTries; attempt++)
             {
-                var psi = new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = string.IsNullOrWhiteSpace(Configuration?.PythonExe) ? "python" : Configuration.PythonExe,
-                    Arguments = "\"" + serverScript + "\"",
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    WorkingDirectory = Path.GetDirectoryName(serverScript) ?? "",
-                    RedirectStandardError = true,
-                    RedirectStandardOutput = true,
-                    RedirectStandardInput = true
-                };
-                psi.Environment["ALIFE_MEMORY_GRAPH_PORT"] = GraphPort.ToString();
-                psi.Environment["ALIFE_MEMORY_GRAPH_INDEX"] = indexPath;
-                psi.Environment["ALIFE_MEMORY_GRAPH_PARENT_STDIN"] = "1";
-                psi.Environment["ALIFE_MEMORY_GRAPH_NO_MODEL"] = "1";
-                psi.Environment["PYTHONIOENCODING"] = "utf-8";
-                var p = System.Diagnostics.Process.Start(psi);
-                if (p == null)
-                    return (false, "无法启动关系图谱服务。", "");
-                graphServer = p;
-                DataReceivedEventHandler logLine = (_, ev) =>
-                {
-                    if (string.IsNullOrEmpty(ev.Data)) return;
-                    try { File.AppendAllText(logPath, DateTime.Now.ToString("HH:mm:ss ") + ev.Data + Environment.NewLine); } catch { }
-                };
-                p.ErrorDataReceived += logLine;
-                p.OutputDataReceived += logLine;
-                p.BeginErrorReadLine();
-                p.BeginOutputReadLine();
+                int candidate = GraphPortBase + attempt;
+                var (ok, _foreign, error) = await TryStartGraphOnPortAsync(candidate, serverScript, indexPath, expected, logPath).ConfigureAwait(false);
+                if (ok) { started = true; break; }
+                lastError = error;
+                if (graphServer != null) await StopGraphServerAsync().ConfigureAwait(false);
             }
 
-            bool pageReady = healthy && await ProbeGraphPageAsync().ConfigureAwait(false);
-            bool ready = healthy && pageReady;
-            for (int i = 0; i < 40 && !ready; i++)
-            {
-                await Task.Delay(150).ConfigureAwait(false);
-                if (graphServer != null && graphServer.HasExited) break;
-                var probe = await ProbeGraphHealthAsync(expected).ConfigureAwait(false);
-                if (probe.foreign)
-                    return (false, $"端口 {GraphPort} 已被占用。", "");
-                ready = probe.ok && await ProbeGraphPageAsync().ConfigureAwait(false);
-            }
+            if (!started)
+                return (false, $"服务启动失败：{lastError}（已尝试 {GraphPortTries} 个端口）。日志：{logPath}", "");
 
-            if (!ready)
-                return (false, $"服务启动超时（端口 {GraphPort}）。日志：{logPath}", "");
 
             return (true, "图谱服务已启动", GraphPageUrl);
         }
